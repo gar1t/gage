@@ -122,7 +122,7 @@ def parse_any(s: str):
 # Simplified https://regex101.com/r/Ly7O1x/3/
 VER_PATTERN = (
     r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
-    r"(?:-(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))?"
+    r"(?:-(?:0|[1-9]\d*|\d*[a-zA-Z-][a-zA-Z-]*\.[0-9]+))?"
 )
 
 __ver_pattern_compiled = re.compile(VER_PATTERN)

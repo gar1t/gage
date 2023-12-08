@@ -1,7 +1,7 @@
 [project]
 
 name = "gage"
-version = "0.1.0"
+version = "0.1.0-dev.0"
 authors = [
   { name="Garrett Smith", email="garrett@placeon.earth" },
 ]
@@ -29,6 +29,13 @@ dependencies = [
     "rich==13.5.2",
     "tomli==2.0.1",
     "typer@git+https://github.com/gar1t/typer",
+]
+
+[project.optional-dependencies]
+
+dev = [
+    "black",
+    "groktest",
 ]
 
 [project.scripts]

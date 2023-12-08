@@ -2,7 +2,7 @@
   "[python]": {
     "editor.defaultFormatter": "ms-python.black-formatter"
   },
-  "python.analysis.ignore": ["examples", "tests"],
+  "python.analysis.ignore": ["examples", "tests", "build"],
   "python.analysis.typeCheckingMode": "basic",
   "python.analysis.diagnosticSeverityOverrides": {
     "reportUntypedFunctionDecorator": "none",

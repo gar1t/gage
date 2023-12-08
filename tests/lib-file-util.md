@@ -71,7 +71,7 @@ Use `textorbinary` sample files to generate a digest.
     >>> sample_dir = sample("textorbinary")
 
     >>> files_digest(ls(sample_dir), sample_dir)
-    '0c5df8c6437e23df5371bdd1b5db7bc9'
+    '6779694aab1ddab3d4e551a8a3168baa'
 
 ## Testing text files
 

@@ -18,6 +18,7 @@ operation.
     |                                                |
     | | matched files  |                             |
     | |----------------|                             |
+    | | .gitignore     |                             |
     | | data.txt       |                             |
     | | gage.toml      |                             |
     | | hello_world.py |                             |
@@ -35,6 +36,7 @@ operation.
           "-**/* dir sentinel=.nocopy"
         ],
         "paths": [
+          ".gitignore",
           "data.txt",
           "gage.toml",
           "hello_world.py"
@@ -69,6 +71,7 @@ operation.
           "-data.txt"
         ],
         "paths": [
+          ".gitignore",
           "gage.toml",
           "hello_world.py"
         ]
@@ -84,6 +87,7 @@ operation.
           "**/*"
         ],
         "paths": [
+          ".gitignore",
           "data.txt",
           "gage.toml",
           "hello_world.py",
