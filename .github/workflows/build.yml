@@ -57,7 +57,7 @@ jobs:
 
       - name: Install test requirements
         run: |
-          test-env/bin/pip install '.[dev]'
+          test-env/bin/pip install groktest
 
       - name: Configure environment for tests
         # Git config required by tests that run git commands
@@ -68,7 +68,7 @@ jobs:
 
       - name: Run built-in tests
         run: |
-          test-env/bin/groktest .
+          test-env/bin/python -m groktest .
 
   # build-windows:
   #   name: Build - Windows
