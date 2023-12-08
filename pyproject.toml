@@ -44,12 +44,8 @@ gage = "gage.__main__:main"
 
 [project.urls]
 
-"Homepage" = "https://github.com/gage/gage"
-"Bug Tracker" = "https://github.com/gage/gage/issues"
-
-[tool.setuptools]
-
-packages = ["gage"]
+"Homepage" = "https://github.com/gageml/gage"
+"Bug Tracker" = "https://github.com/gageml/gage/issues"
 
 [tool.black]
 

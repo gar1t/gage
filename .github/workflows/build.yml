@@ -6,12 +6,8 @@ on:
 
   workflow_dispatch:
     inputs:
-      linux:
-        description: Build for Linux
-        type: boolean
-        default: true
-      macos:
-        description: Build for macOS
+      posix:
+        description: Build for POSIX
         type: boolean
         default: true
       windows:
@@ -26,7 +22,7 @@ on:
 jobs:
   build-posix:
     name: Build - POSIX
-    if: ${{ inputs.linux || inputs.macos}}
+    if: ${{ inputs.posix }}
     strategy:
       fail-fast: false
       matrix:
