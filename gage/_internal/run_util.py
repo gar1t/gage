@@ -861,7 +861,7 @@ def _maybe_log_file_changed(
 
 
 def _finalize_files_log(run: Run):
-    filename = run_meta_path(run, "log", "files")
+    filename = _meta_files_log_filename(run)
     set_readonly(filename)
 
 
@@ -932,7 +932,7 @@ def _apply_to_files_log(run: Run, type: RunFileType):
 
 
 def _iter_run_files(run: Run):
-    return _scan_files(run.run_dir)
+    return sorted(_scan_files(run.run_dir), key=lambda entry: entry.path)
 
 
 def _scan_files(dir: str) -> Generator[os.DirEntry[str], Any, None]:
@@ -966,7 +966,7 @@ def _iter_files_log(run: Run):
     schema = _run_meta_schema(run)
     if schema != META_SCHEMA:
         raise TypeError(f"unsupported meta schema: {schema!r}")
-    filename = run_meta_path(run, "log", "files")
+    filename = _meta_files_log_filename(run)
     try:
         f = open(filename)
     except FileNotFoundError:

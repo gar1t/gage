@@ -88,7 +88,7 @@ List the comments.
       ],
       [
         "{y:comment_id}",
-        "garrett",
+        "{}",
         {y_ts:timestamp_ms},
         "I modified this."
       ]

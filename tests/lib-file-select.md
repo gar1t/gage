@@ -512,30 +512,30 @@ An empty rule list selects nothing.
 Select everything.
 
     >>> preview([include("*")])
-    a.txt
-    b.txt
+    A/B/c.txt
     A/a.txt
     A/b.bin
-    A/B/c.txt
     C/a.txt
     C/b.txt
     C/c.bin
+    a.txt
+    b.txt
 
 Select file names.
 
     >>> preview([include(["a.txt", "b.txt"])])
-    a.txt
-    b.txt
     A/a.txt
     C/a.txt
     C/b.txt
+    a.txt
+    b.txt
 
 Select under A.
 
     >>> preview([include("A/*")])
+    A/B/c.txt
     A/a.txt
     A/b.bin
-    A/B/c.txt
 
     >>> preview([include("A/*/c.txt")])
     A/B/c.txt
@@ -603,19 +603,19 @@ Show various selections.
 To select files, use `**/<pattern>``.
 
     >>> preview(["**/*"])
-    a.txt
-    b.txt
+    A/B/c.txt
     A/a.txt
     A/b.bin
-    A/B/c.txt
     C/a.txt
     C/b.txt
     C/c.bin
+    a.txt
+    b.txt
 
     >>> preview(["**/a.txt"])
-    a.txt
     A/a.txt
     C/a.txt
+    a.txt
 
     >>> preview(["**/C/a.txt"])
     C/a.txt
@@ -635,32 +635,32 @@ To select files, use `**/<pattern>``.
 Exclude patterns are specified with a "-" prefix.
 
     >>> preview(["**/*", "-a.txt"])
-    b.txt
+    A/B/c.txt
     A/a.txt
     A/b.bin
-    A/B/c.txt
     C/a.txt
     C/b.txt
     C/c.bin
+    b.txt
 
     >>> preview(["**/*", "-**/*.bin"])
-    a.txt
-    b.txt
-    A/a.txt
     A/B/c.txt
+    A/a.txt
     C/a.txt
     C/b.txt
+    a.txt
+    b.txt
 
 Use `text` or `binary` as a pattern annotation to indicate the match
 type.
 
     >>> preview(["**/* text"])
-    a.txt
-    b.txt
-    A/a.txt
     A/B/c.txt
+    A/a.txt
     C/a.txt
     C/b.txt
+    a.txt
+    b.txt
 
     >>> preview(["**/* binary"])
     A/b.bin
@@ -670,11 +670,11 @@ Use `dir` to exclude dirs. This applies the performance optimization
 described above.
 
     >>> preview(["**/*", "-A dir"])
-    a.txt
-    b.txt
     C/a.txt
     C/b.txt
     C/c.bin
+    a.txt
+    b.txt
 
 Use `size>N` or `size<N` to include or exclude by size.
 
@@ -683,46 +683,46 @@ Use `size>N` or `size<N` to include or exclude by size.
     C/c.bin
 
     >>> preview(["**/* size<20"])
-    a.txt
-    b.txt
-    A/a.txt
     A/B/c.txt
+    A/a.txt
     C/a.txt
     C/b.txt
+    a.txt
+    b.txt
 
     >>> preview(["**/*", "-**/b.* size<20"])
-    a.txt
+    A/B/c.txt
     A/a.txt
     A/b.bin
-    A/B/c.txt
     C/a.txt
     C/c.bin
+    a.txt
 
 Use `sentinel` to skip directories containing sentinels.
 
     >>> preview(["**/*", "-**/* dir sentinel=c.txt"])
-    a.txt
-    b.txt
     A/a.txt
     A/b.bin
     C/a.txt
     C/b.txt
     C/c.bin
+    a.txt
+    b.txt
 
 Use `max_matches` to limit result count for a pattern.
 
     >>> preview(["**/* max-matches=5"])
+    A/B/c.txt
+    A/a.txt
+    A/b.bin
     a.txt
     b.txt
-    A/a.txt
-    A/b.bin
-    A/B/c.txt
 
     >>> preview(["**/* max-matches=5", "-a.*"])
-    b.txt
+    A/B/c.txt
     A/a.txt
     A/b.bin
-    A/B/c.txt
+    b.txt
 
 ### Common exclude patterns
 

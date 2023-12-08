@@ -33,12 +33,12 @@
         ],
         "paths": [
           ".gitignore",
-          "gage.toml",
-          "my_app.py",
           "conf/__init__.py",
           "conf/config.yaml",
           "conf/db/mysql.yaml",
-          "conf/db/postgresql.yaml"
+          "conf/db/postgresql.yaml",
+          "gage.toml",
+          "my_app.py"
         ]
       }
     }

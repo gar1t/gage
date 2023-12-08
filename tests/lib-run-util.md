@@ -214,9 +214,9 @@ The list of source code files in `log/files` reflects the creation of
 `config.json` by the copy sourcecode exec command.
 
     >>> cat(run_meta_path(run, "log", "files"))  # +parse
+    a s {:timestamp} config.json
     a s {:timestamp} config.json.in
     a s {:timestamp} setup.py
-    a s {:timestamp} config.json
     a s {:timestamp} train.py
 
 `config.json` appears in the run manifest when meta staging is finalized.
@@ -224,9 +224,9 @@ The list of source code files in `log/files` reflects the creation of
     >>> finalize_staged_run(run)
 
     >>> cat(run_meta_path(run, "manifest"))
+    s 5cc1441b4902cd35921288754e412e0eb949d44d81e4e0fcb281a913a7c3e820 config.json
     s 2e800a0aca54fbeca8d7f5a75f6be7bde6bc12ce6d3c5fc0236edb69660b9ffd config.json.in
     s d49cee364b51492d3330dfa0ff98173704ac632e03a938e73036459fd56a9827 setup.py
-    s 5cc1441b4902cd35921288754e412e0eb949d44d81e4e0fcb281a913a7c3e820 config.json
     s e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 train.py
 
 ## Copy dependencies

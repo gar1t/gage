@@ -664,4 +664,4 @@ def select_files(
 ):
     handler = _PreviewHandler(src_dir)
     copy_tree(src_dir, "", select, handler, follow_links)
-    return [path for path, _result in handler.to_copy]
+    return sorted([path for path, _result in handler.to_copy])
