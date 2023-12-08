@@ -255,10 +255,27 @@ def ls(
     else:
         for path in paths:
             if permissions:
-                path_perm = stat.filemode(os.stat(os.path.join(root, path)).st_mode)
-                print(f"{path_perm} {path}")
+                perm = _ls_path_permissions(os.path.join(root, path))
+                print(f"{perm} {path}")
             else:
                 print(path)
+
+
+def _ls_path_permissions(path: str):
+    """Returns path permissions using `stat.filemode`.
+
+    Group write permissions are coerced to be what the user write
+    permission is. This is special case for tests, which may run in
+    environments where the user group doesn't have write access by
+    default. To handle these cases, the user write flag is used, if set,
+    for the group write permission, even if the group does not have
+    write permission.
+    """
+    perm = stat.filemode(os.stat(path).st_mode)
+    assert len(perm) == 10, (perm, path)
+    if perm[2] == "w" and perm[5] == "-":
+        return perm[:5] + "w" + perm[6:]
+    return perm
 
 
 def _filter_ignored(paths: list[str], ignore: FindIgnore):
