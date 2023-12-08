@@ -6,14 +6,18 @@ on:
 
   workflow_dispatch:
     inputs:
-      skip_posix:
-        description: Skip build for POSIX
+      linux:
+        description: Build for Linux
         type: boolean
-        default: false
-      skip_windows:
-        description: Skip build for Windows
+        default: true
+      macos:
+        description: Build for macOS
         type: boolean
-        default: false
+        default: true
+      windows:
+        description: Build for Windows
+        type: boolean
+        default: true
       release:
         description: Publish to PyPI (select for release)
         type: boolean
@@ -22,7 +26,7 @@ on:
 jobs:
   build-posix:
     name: Build - POSIX
-    if: ${{ !inputs.skip_posix }}
+    if: ${{ inputs.linux || inputs.macos}}
     strategy:
       fail-fast: false
       matrix:
@@ -54,6 +58,7 @@ jobs:
           python -m venv test-env
           test-env/bin/pip install --upgrade pip
           test-env/bin/pip install dist/*.whl
+          test-env/bin/gage check
 
       - name: Install test requirements
         run: |
@@ -66,13 +71,13 @@ jobs:
           git config --global user.email unused@localhost
           git config --global init.defaultBranch main
 
-      - name: Run built-in tests
+      - name: Run tests
         run: |
-          test-env/bin/python -m groktest .
+          test-env/bin/python -m groktest tests/project-version.md
 
   # build-windows:
   #   name: Build - Windows
-  #   if: ${{ !inputs.skip_windows }}
+  #   if: ${{ inputs.windows }}
   #   strategy:
   #     fail-fast: false
   #     matrix:
