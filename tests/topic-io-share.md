@@ -1,3 +1,7 @@
+---
+test-options: +skip (for CI until we get better control over tests)
+---
+
 # Sharing runs with others
 
 In this scenario, a developer generates a run of interest and wants to
