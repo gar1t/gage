@@ -38,6 +38,12 @@ dev = [
     "groktest",
 ]
 
+[tool.setuptools.package-data]
+
+gage = [
+    "*.schema.json"
+]
+
 [project.scripts]
 
 gage = "gage.__main__:main"
