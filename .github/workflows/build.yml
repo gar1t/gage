@@ -119,7 +119,6 @@ jobs:
           mkdir \Tmp -Force
 
       - name: Run tests
-        env:
         run: |
           test-env\Scripts\groktest .
         shell: cmd
