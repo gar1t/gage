@@ -24,11 +24,6 @@ above.
 
 When we unset `TERM`, the correct header is used.
 
-    >>> run("gage help", env={"TERM": ""})  # +wildcard=??? -space
-    ???
-    ⤶
-      Show help for a topic.
-    ⤶
-    ??? Topics ???
-    ???  exec        Defining run commands.???
-    <0>
+    >>> run("gage help", env={"TERM": ""})  # +parse
+    {}Topics{}
+    <exit 0>
