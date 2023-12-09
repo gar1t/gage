@@ -68,6 +68,8 @@ jobs:
           git config --global init.defaultBranch main
 
       - name: Run tests
+        env:
+          CI: 1
         run: |
           test-env/bin/groktest .
 
@@ -119,6 +121,8 @@ jobs:
           mkdir \Tmp -Force
 
       - name: Run tests
+        env:
+          CI: 1
         run: |
           test-env\Scripts\groktest .
         shell: cmd
