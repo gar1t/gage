@@ -30,6 +30,7 @@ __all__ = [
     "files_digest",
     "ls",
     "find_up",
+    "is_readonly",
     "is_text_file",
     "make_dir",
     "make_executable",
@@ -661,6 +662,10 @@ def set_readonly(filename: str, readonly: bool = True):
         else stat.S_IWUSR | stat.S_IREAD
     )
     os.chmod(filename, mode)
+
+
+def is_readonly(filename: str):
+    return not os.access(filename, os.W_OK)
 
 
 def safe_filename(s: str):

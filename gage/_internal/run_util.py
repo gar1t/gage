@@ -7,6 +7,7 @@ from logging import Logger
 from .types import *
 
 import datetime
+import io
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ from .file_select import copy_files
 
 from .file_util import ensure_dir
 from .file_util import file_sha256
+from .file_util import is_readonly
 from .file_util import make_dir
 from .file_util import set_readonly
 from .file_util import write_file
@@ -711,7 +713,8 @@ def _write_staged_files_manifest(run: Run, log: Logger):
     with m:
         for type, path in _reduce_files_log(run):
             filename = os.path.join(run.run_dir, path)
-            set_readonly(filename)
+            if not os.path.islink(filename):
+                set_readonly(filename)
             digest = file_sha256(filename)
             m.add(type, digest, path)
 
@@ -838,7 +841,8 @@ def _write_run_files_manifest(run: Run, log: Logger):
     with m:
         for type, path in _reduce_files_log(run):
             filename = os.path.join(run.run_dir, path)
-            set_readonly(filename)
+            if not is_readonly(filename) and not os.path.islink(filename):
+                set_readonly(filename)
             digest = file_sha256(filename)
             _maybe_log_file_changed(path, digest, index, log)
             m.add(type, digest, path)
@@ -1030,7 +1034,11 @@ class RunManifestEntry(NamedTuple):
 class RunManifest:
     def __init__(self, run: Run, mode: Literal["r", "w", "a"] = "r"):
         self.filename = _meta_manifest_filename(run)
-        self._f = open(self.filename, mode)
+        try:
+            self._f = open(self.filename, mode)
+        except Exception as e:
+            log.warning("Error reading manifest %s: %s", self.filename, e)
+            self._f = io.StringIO()
 
     def __iter__(self):
         for line in self._f:
