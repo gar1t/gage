@@ -227,7 +227,7 @@ Show the run.
     | #  | name    | operation       | started   | status      |
     |--{}--|
     | 1  | {x:rn}  | hello:hello     |           | staged      |
-    | 2  | {:rn}   | hello:hello     | now       | completed   |
+    | 2  | {:rn}   | hello:hello     | {}        | completed   |
     ⤶
      Showing 2 of 4 runs (use -m to show more)
     <0>

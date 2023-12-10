@@ -132,16 +132,16 @@ When used in a string, resolved refs are encoded:
 
 Escaped references aren't resolved:
 
-    >>> resolve_refs("\${a}", {})
+    >>> resolve_refs("\\${a}", {})
     '${a}'
 
-    >>> resolve_refs("\${a}", {"a": "a"})
+    >>> resolve_refs("\\${a}", {"a": "a"})
     '${a}'
 
-    >>> resolve_refs("foo \${bar} baz", {})
+    >>> resolve_refs("foo \\${bar} baz", {})
     'foo ${bar} baz'
 
-    >>> resolve_refs("foo \${bar} baz", {"bar": "bar"})
+    >>> resolve_refs("foo \\${bar} baz", {"bar": "bar"})
     'foo ${bar} baz'
 
 ### `resolve_all_refs`
