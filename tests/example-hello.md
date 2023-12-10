@@ -225,7 +225,7 @@ Show the run.
 
     >>> run("gage ls -n2")  # +parse -space
     | #  | name    | operation       | started   | status      |
-    |----|---------|-----------------|-----------|-------------|
+    |--{}--|
     | 1  | {x:rn}  | hello:hello     |           | staged      |
     | 2  | {:rn}   | hello:hello     | now       | completed   |
     ⤶

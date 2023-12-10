@@ -401,8 +401,8 @@ method.
 
 Let's dynamically create a module for our tests:
 
-    >>> import imp
-    >>> howdy = imp.new_module("howdy")
+    >>> import types
+    >>> howdy = types.ModuleType("howdy")
     >>> howdy_def = """
     ... def say(msg):
     ...   print(msg)
@@ -722,3 +722,5 @@ The function `first_breakable_line(src)` is an alias for
 
     >>> python_util.first_breakable_line(breakable)
     5
+
+## Finding

@@ -6,6 +6,7 @@ import ast
 import logging
 import os
 import re
+import sys
 import types
 
 try:
@@ -532,28 +533,6 @@ def safe_module_name(s: str):
     return re.sub("-", "_", s)
 
 
-__modules: dict[Any, tuple[str, str | None]] = {}
-
-
-
-
-
-def _find_package_main(mod_path: str):
-    names = ["__main__.py", "__main__.pyc"]
-    for name in names:
-        path = os.path.join(mod_path, name)
-        if os.path.exists(path):
-            return path
-    return None
-
-
-def _split_module(main_mod: str, gf_dir: str):
-    parts = main_mod.rsplit("/", 1)
-    if len(parts) == 1:
-        parts = ".", parts[0]
-    return os.path.join(gf_dir, parts[0]), parts[1]
-
-
 def check_package_version(version: str, req: str):
     parsed_req = _parse_req_for_version_spec(req)
     matches = list(parsed_req.specifier.filter({version: ""}, prereleases=True))
@@ -654,26 +633,3 @@ except AttributeError:
 
 def _is_node_breakable(node: Any):
     return type(node) not in NON_BREAKABLE_NODE_TYPES
-
-
-# def find_python_interpreter(version_spec: str):
-#     req = _parse_req_for_version_spec(version_spec)
-#     python_interps = {ver: path for path, ver in python_interpreters()}
-#     matching = list(req.specifier.filter(sorted(python_interps)))
-#     if not matching:
-#         return None
-#     matching_ver = matching[0]
-#     return python_interps[matching_ver], matching_ver
-
-
-# def python_interpreters() -> list[tuple[str, str]]:
-#     import glob
-#     from guild import config
-
-#     bin_dir = os.path.dirname(config.python_exe())
-#     ret = []
-#     for path in glob.glob(os.path.join(bin_dir, "python*")):
-#         m = re.match(r"python([0-9\.]+)$", os.path.basename(path))
-#         if m:
-#             ret.append((path, m.group(1)))
-#     return ret
