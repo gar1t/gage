@@ -2,18 +2,10 @@
 
 from typing import *
 
-import warnings
-
-with warnings.catch_warnings():
-    warnings.filterwarnings("ignore", category=DeprecationWarning)
-    # pylint: disable=deprecated-module
-    import imp
-
 import ast
 import logging
 import os
 import re
-import sys
 import types
 
 try:
@@ -543,41 +535,7 @@ def safe_module_name(s: str):
 __modules: dict[Any, tuple[str, str | None]] = {}
 
 
-def find_module(main_mod: _Module, model_paths: list[str]):
-    cache_key = (main_mod, tuple(model_paths))
-    try:
-        return __modules[cache_key]
-    except KeyError:
-        __modules[cache_key] = result = _find_module(main_mod, model_paths)
-        return result
 
-
-def _find_module(main_mod: _Module, model_paths: list[str]):
-    for model_path in model_paths:
-        main_mod_sys_path, module = _split_module(main_mod, model_path)
-        # Copied from guild.op_main
-        parts = module.split(".")
-        module_path = parts[0:-1]
-        module_name_part = parts[-1]
-        for sys_path_item in [main_mod_sys_path] + sys.path:
-            cur_path = os.path.join(sys_path_item, *module_path)
-            try:
-                f, maybe_mod_path, _desc = imp.find_module(module_name_part, [cur_path])
-            except ImportError:
-                pass
-            else:
-                if f:
-                    f.close()
-                else:
-                    if maybe_mod_path:
-                        maybe_mod_path = _find_package_main(maybe_mod_path)
-                    if not maybe_mod_path:
-                        raise ImportError(
-                            f"No module named {module}.__main__ ('{module}' is "
-                            "a package and cannot be directly executed)"
-                        )
-                return main_mod_sys_path, maybe_mod_path
-    raise ImportError(f"No module named {main_mod}")
 
 
 def _find_package_main(mod_path: str):
