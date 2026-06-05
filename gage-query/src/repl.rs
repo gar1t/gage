@@ -1,0 +1,220 @@
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use datafusion::physical_plan::{ExecutionPlan, collect, display::DisplayableExecutionPlan};
+use datafusion::prelude::SessionContext;
+use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
+
+use crate::print_format::PrintFormat;
+
+pub async fn exec_command(
+    ctx: &SessionContext,
+    sql: &str,
+    format: PrintFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    exec_with_stats(ctx, sql, format).await?;
+    Ok(())
+}
+
+struct QueryStats {
+    elapsed: Duration,
+    rows: usize,
+    batches: usize,
+    plan: Arc<dyn ExecutionPlan>,
+}
+
+async fn exec_with_stats(
+    ctx: &SessionContext,
+    sql: &str,
+    format: PrintFormat,
+) -> Result<QueryStats, Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+    let batches = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+    let elapsed = start.elapsed();
+    format.print_batches(&batches)?;
+    let rows = batches.iter().map(|b| b.num_rows()).sum();
+    Ok(QueryStats {
+        elapsed,
+        rows,
+        batches: batches.len(),
+        plan,
+    })
+}
+
+pub async fn run_repl(
+    ctx: &SessionContext,
+    mut format: PrintFormat,
+    quiet: bool,
+    timing: bool,
+    stats: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let history_path = gage_core::config::gage_home().join("query_history");
+    if let Some(parent) = history_path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+
+    let mut editor = DefaultEditor::new()?;
+    if history_path.exists() {
+        editor.load_history(&history_path)?;
+    }
+
+    if !quiet {
+        println!("gage query - type SQL followed by ; or \\? for help");
+    }
+
+    let mut state = ReplState {
+        format: &mut format,
+        timing,
+        stats,
+    };
+    let mut buf = String::new();
+
+    loop {
+        let prompt = if buf.is_empty() { "gage> " } else { "   -> " };
+
+        match editor.readline(prompt) {
+            Ok(line) => {
+                let trimmed = line.trim();
+
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                if buf.is_empty() && trimmed.starts_with('\\') {
+                    editor.add_history_entry(trimmed)?;
+                    match handle_backslash(ctx, trimmed, &mut state).await {
+                        BackslashResult::Continue => continue,
+                        BackslashResult::Quit => break,
+                    }
+                }
+
+                if !buf.is_empty() {
+                    buf.push(' ');
+                }
+                buf.push_str(trimmed);
+
+                if buf.ends_with(';') {
+                    let sql = buf.trim_end_matches(';').trim();
+                    if !sql.is_empty() {
+                        editor.add_history_entry(&buf)?;
+                        match exec_with_stats(ctx, sql, *state.format).await {
+                            Ok(stats) => report(&stats, &state),
+                            Err(e) => eprintln!("Error: {e}"),
+                        }
+                    }
+                    buf.clear();
+                }
+            }
+            Err(ReadlineError::Interrupted) => {
+                buf.clear();
+                continue;
+            }
+            Err(ReadlineError::Eof) => break,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                break;
+            }
+        }
+    }
+
+    editor.save_history(&history_path)?;
+    Ok(())
+}
+
+struct ReplState<'a> {
+    format: &'a mut PrintFormat,
+    timing: bool,
+    stats: bool,
+}
+
+fn report(stats: &QueryStats, state: &ReplState<'_>) {
+    if state.timing {
+        let ms = stats.elapsed.as_secs_f64() * 1000.0;
+        let row_word = if stats.rows == 1 { "row" } else { "rows" };
+        let batch_word = if stats.batches == 1 {
+            "batch"
+        } else {
+            "batches"
+        };
+        println!(
+            "Time: {:.3} ms ({} {row_word}, {} {batch_word})",
+            ms, stats.rows, stats.batches
+        );
+    }
+    if state.stats {
+        let displayable = DisplayableExecutionPlan::with_metrics(stats.plan.as_ref());
+        println!("{}", displayable.indent(true));
+    }
+}
+
+enum BackslashResult {
+    Continue,
+    Quit,
+}
+
+async fn handle_backslash(
+    ctx: &SessionContext,
+    input: &str,
+    state: &mut ReplState<'_>,
+) -> BackslashResult {
+    let parts: Vec<&str> = input.splitn(2, ' ').collect();
+    let cmd = *parts.first().expect("splitn yields at least one substr");
+    let arg = parts.get(1).map(|s| s.trim());
+
+    match cmd {
+        "\\q" => return BackslashResult::Quit,
+        "\\d" => {
+            if let Some(table) = arg {
+                let sql = format!("DESCRIBE {table}");
+                if let Err(e) = exec_command(ctx, &sql, *state.format).await {
+                    eprintln!("Error: {e}");
+                }
+            } else if let Err(e) = exec_command(ctx, "SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name", *state.format).await {
+                eprintln!("Error: {e}");
+            }
+        }
+        "\\format" => {
+            if let Some(fmt_str) = arg {
+                match fmt_str.parse::<PrintFormat>() {
+                    Ok(f) => {
+                        *state.format = f;
+                        println!("Output format: {fmt_str}");
+                    }
+                    Err(_) => eprintln!("Unknown format: {fmt_str}. Options: table, csv, json, ndjson, yaml"),
+                }
+            } else {
+                eprintln!("Usage: \\format <table|csv|json|ndjson|yaml>");
+            }
+        }
+        "\\timing" => state.timing = parse_toggle(arg, state.timing, "Timing"),
+        "\\stats" => state.stats = parse_toggle(arg, state.stats, "Stats"),
+        "\\?" | "\\help" => {
+            println!("\\d              List tables");
+            println!("\\d <table>      Show table schema");
+            println!("\\format <fmt>   Set output format (table, csv, json, ndjson, yaml)");
+            println!("\\timing [on|off]  Toggle query wall-clock time");
+            println!("\\stats [on|off]   Toggle per-operator plan metrics");
+            println!("\\q              Quit");
+            println!("\\?              Show this help");
+        }
+        _ => eprintln!("Unknown command: {cmd}. Try \\? for help"),
+    }
+
+    BackslashResult::Continue
+}
+
+fn parse_toggle(arg: Option<&str>, current: bool, label: &str) -> bool {
+    let next = match arg {
+        None | Some("") => !current,
+        Some("on") => true,
+        Some("off") => false,
+        Some(other) => {
+            eprintln!("Unknown value: {other}. Use on, off, or omit to toggle");
+            return current;
+        }
+    };
+    println!("{label} is {}", if next { "on" } else { "off" });
+    next
+}

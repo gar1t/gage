@@ -1,0 +1,9 @@
+# Rust
+target
+
+# Claude
+.mcp.json
+.claude/*.local.json
+
+# Datafusion
+.history

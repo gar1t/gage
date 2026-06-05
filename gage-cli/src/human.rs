@@ -1,0 +1,44 @@
+pub fn format_elapsed_ms(ms: i64) -> String {
+    let now_ms = gage_core::datetime::now_ms();
+    let secs = (now_ms - ms) / 1000;
+    if secs < 0 {
+        "future".to_string()
+    } else if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
+}
+
+pub fn format_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let days = secs / 86400;
+    if days > 0 {
+        format!("{days:02}:{h:02}:{m:02}:{s:02}")
+    } else {
+        format!("{h:02}:{m:02}:{s:02}")
+    }
+}
+
+pub fn format_size(bytes: i64) -> String {
+    const KB: i64 = 1_000;
+    const MB: i64 = 1_000_000;
+    const GB: i64 = 1_000_000_000;
+
+    if bytes < KB {
+        format!("{bytes} B")
+    } else if bytes < MB {
+        format!("{:.1} kB", bytes as f64 / KB as f64)
+    } else if bytes < GB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    }
+}

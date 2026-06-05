@@ -1,0 +1,40 @@
+[package]
+name = "gage-cli"
+version.workspace = true
+edition.workspace = true
+repository = "https://github.com/gar1t/gage-2026-03"
+
+[[bin]]
+name = "gage"
+path = "src/main.rs"
+
+[dependencies]
+cliclack = "0.3"
+clap = { version = "4", features = ["derive", "wrap_help"] }
+datafusion = { workspace = true }
+gage-core = { path = "../gage-core" }
+gage-db = { path = "../gage-db" }
+gage-mcp = { path = "../gage-mcp" }
+gage-tui = { path = "../gage-tui" }
+gage-claude = { path = "../gage-claude" }
+humantime = "2"
+libc = "0.2"
+tabled = { version = "0.20", features = ["ansi"] }
+textwrap = "0.16"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+] }
+tokio-util = "0.7"
+console = "0.16.2"
+serde_json = "1"
+gage-query = { path = "../gage-query" }
+gage-scan = { path = "../gage-scan" }
+indicatif = "0.18"
+num_cpus = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints]
+workspace = true

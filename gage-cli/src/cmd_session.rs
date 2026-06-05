@@ -1,0 +1,477 @@
+use std::path::PathBuf;
+use std::time::Duration;
+
+use clap::{Args, Subcommand};
+use cliclack as cli;
+use datafusion::arrow::array::{Array, Int64Array, StringArray, TimestampMillisecondArray};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::prelude::SessionContext;
+use gage_claude::session::delete_session;
+use gage_core::uuid::short_uuid;
+use tabled::{
+    Table,
+    settings::{
+        Alignment, Color, Style, Width,
+        object::{Columns, Object, Rows},
+        peaker::Peaker,
+    },
+};
+
+use crate::dialog::{self, DialogError};
+use crate::style;
+
+#[derive(Subcommand)]
+pub enum SessionCommand {
+    /// List available sessions
+    List(SessionListArgs),
+    /// Delete sessions
+    Delete(SessionDeleteArgs),
+    /// View a session
+    View(SessionViewArgs),
+}
+
+#[derive(Args)]
+pub struct SessionViewArgs {
+    /// Session ID (prefix match); omit to pick from recent sessions
+    pub session: Option<String>,
+}
+
+#[derive(Args)]
+pub struct SessionFilterArgs {
+    /// Filter by project path (can be specified multiple times)
+    #[arg(short, long, value_name = "PATH")]
+    project: Vec<PathBuf>,
+
+    /// Filter to sessions modified within this duration (e.g. 1h, 30m, 7d)
+    #[arg(short, long, value_parser = super::parse_duration)]
+    since: Option<Duration>,
+
+    /// Only show empty sessions (no message with real content)
+    #[arg(long)]
+    empty: bool,
+}
+
+#[derive(Args)]
+pub struct SessionListArgs {
+    #[command(flatten)]
+    limit: crate::limit::LimitArgs,
+
+    #[command(flatten)]
+    filter: SessionFilterArgs,
+
+    /// Show the full session ID, never truncating it
+    #[arg(long)]
+    full_id: bool,
+}
+
+#[derive(Args)]
+pub struct SessionDeleteArgs {
+    /// Session IDs (prefix match)
+    #[arg(conflicts_with = "empty")]
+    pub ids: Vec<String>,
+
+    /// Delete all empty sessions (no message with real content)
+    #[arg(long)]
+    pub empty: bool,
+
+    /// Skip confirmation prompt
+    #[arg(short, long)]
+    pub yes: bool,
+}
+
+fn home_slug() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut slug = String::new();
+    for c in home.chars() {
+        slug.push(if c.is_ascii_alphanumeric() { c } else { '-' });
+    }
+    slug.push('-');
+    slug
+}
+
+fn filter_clauses(filter: &SessionFilterArgs) -> Vec<String> {
+    let mut clauses = Vec::new();
+    for p in &filter.project {
+        let path_str = p.to_string_lossy().replace('\'', "''");
+        clauses.push(format!("path LIKE '%/{path_str}/%'"));
+    }
+    if let Some(duration) = filter.since {
+        let cutoff = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as i64
+            - duration.as_micros() as i64;
+        clauses.push(format!("mtime >= CAST({cutoff} AS TIMESTAMP)"));
+    }
+    if filter.empty {
+        clauses.push("is_empty".to_string());
+    }
+    clauses
+}
+
+async fn run_query(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
+    match ctx.sql(sql).await {
+        Ok(df) => match df.collect().await {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        },
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Truncates the biggest column first (like `PriorityMax::left`), but never
+/// picks the Id column (index 0) when `protect_id` is set, so a full session
+/// ID is preserved while the other columns absorb the shrink.
+struct IdAwarePriority {
+    protect_id: bool,
+}
+
+impl IdAwarePriority {
+    fn new(protect_id: bool) -> Self {
+        Self { protect_id }
+    }
+}
+
+impl Peaker for IdAwarePriority {
+    fn peak(&mut self, mins: &[usize], widths: &[usize]) -> Option<usize> {
+        let start = if self.protect_id { 1 } else { 0 };
+        widths
+            .iter()
+            .copied()
+            .enumerate()
+            .skip(start)
+            .rev()
+            .filter(|&(i, w)| w != 0 && (mins.is_empty() || mins.get(i).is_none_or(|&m| w > m)))
+            .max_by_key(|&(_, w)| w)
+            .map(|(i, _)| i)
+    }
+}
+
+pub async fn list(args: SessionListArgs) {
+    let ctx = gage_query::create_context_default().await;
+
+    let clauses = filter_clauses(&args.filter);
+    let where_clause = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+
+    let count_sql = format!("SELECT COUNT(*) FROM session{where_clause}");
+    let count_batches = run_query(&ctx, &count_sql).await;
+    let total = count_batches
+        .first()
+        .map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0) as usize
+        })
+        .unwrap_or(0);
+    if total == 0 {
+        println!("No sessions found");
+        return;
+    }
+
+    let show = args.limit.show_count(total);
+
+    let sql = format!(
+        "SELECT id, project, mtime, size, title, message_count \
+         FROM session{where_clause} ORDER BY mtime DESC LIMIT {show}"
+    );
+    let batches = run_query(&ctx, &sql).await;
+
+    let prefix = home_slug();
+    let mut table_rows: Vec<Vec<String>> = Vec::new();
+
+    for batch in &batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let projects = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mtimes = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap();
+        let sizes = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let titles = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let counts = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        for i in 0..batch.num_rows() {
+            let id = ids.value(i);
+            let project_name = projects.value(i);
+            let project = project_name
+                .strip_prefix(&*prefix)
+                .unwrap_or(project_name)
+                .to_string();
+            let modified = crate::human::format_elapsed_ms(mtimes.value(i));
+            let size = crate::human::format_size(sizes.value(i));
+            let title = if titles.is_null(i) {
+                String::new()
+            } else {
+                titles.value(i).to_string()
+            };
+            let count = counts.value(i).to_string();
+            let id_display = if args.full_id {
+                id.to_string()
+            } else {
+                short_uuid(id).to_string()
+            };
+            table_rows.push(vec![id_display, project, modified, size, title, count]);
+        }
+    }
+
+    let header: Vec<String> = ["Id", "Project", "Modified", "Size", "Title", "Messages"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    let col_count = header.len();
+    let mut table = Table::from_iter(std::iter::once(header).chain(table_rows));
+    table
+        .with(Style::rounded())
+        .modify(Rows::first(), Color::FG_BRIGHT_YELLOW)
+        .modify(Columns::first().not(Rows::first()), Color::FG_BRIGHT_YELLOW)
+        .modify(Columns::new(2..col_count).not(Rows::first()), style::dim())
+        .modify(Columns::last(), Alignment::right());
+    let term_width = console::Term::stdout().size().1 as usize;
+    table.with(
+        Width::truncate(term_width)
+            .suffix("…")
+            .priority(IdAwarePriority::new(args.full_id)),
+    );
+    let table = table.to_string();
+    println!("{table}");
+
+    args.limit.print_summary(show, total, "session");
+}
+
+pub async fn delete(args: SessionDeleteArgs) {
+    if args.ids.is_empty() && !args.empty {
+        eprintln!(
+            "gage session delete: provide session IDs or --empty\n\n\
+            Use 'gage session list' to show sessions"
+        );
+        std::process::exit(1);
+    }
+
+    let mut sessions: Vec<(String, PathBuf)> = Vec::new();
+    let empty_count;
+    let non_empty_count;
+
+    if args.empty {
+        let spinner = style::spinner("Looking for empty sessions...");
+        let ctx = gage_query::create_context_default().await;
+        let sql = "SELECT id, path FROM session WHERE is_empty";
+        let batches = run_query(&ctx, sql).await;
+        for batch in &batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let paths = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                sessions.push((ids.value(i).to_string(), PathBuf::from(paths.value(i))));
+            }
+        }
+        spinner.finish_and_clear();
+        empty_count = sessions.len();
+        non_empty_count = 0;
+    } else {
+        let ctx = gage_query::create_context_default().await;
+        let mut errors = 0;
+        for prefix in &args.ids {
+            match gage_claude::session::one_session(prefix) {
+                Ok(session) => sessions.push((session.id, session.src)),
+                Err(e) => {
+                    eprintln!("{e}");
+                    errors += 1;
+                }
+            }
+        }
+        if errors > 0 {
+            std::process::exit(1);
+        }
+
+        let in_list = sessions
+            .iter()
+            .map(|(id, _)| format!("'{}'", id.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT id FROM session WHERE NOT is_empty AND id IN ({in_list})");
+        let batches = run_query(&ctx, &sql).await;
+        let mut has_messages = std::collections::HashSet::new();
+        for batch in &batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                has_messages.insert(ids.value(i).to_string());
+            }
+        }
+        non_empty_count = sessions
+            .iter()
+            .filter(|(id, _)| has_messages.contains(id))
+            .count();
+        empty_count = sessions.len() - non_empty_count;
+    }
+
+    if sessions.is_empty() {
+        dialog::run("Delete sessions", || Ok("Nothing to delete".into()));
+        return;
+    }
+
+    dialog::run("Delete sessions", || {
+        if empty_count > 0 {
+            cli::log::remark(format!("Empty sessions: {empty_count}"))?;
+        }
+        if non_empty_count > 0 {
+            cli::log::remark(format!("Non-empty sessions: {non_empty_count}"))?;
+        }
+
+        if !args.yes {
+            let confirmed =
+                cli::confirm("Permanently delete these sessions? This cannot be undone.")
+                    .initial_value(false)
+                    .interact()?;
+            if !confirmed {
+                return Err(DialogError::Canceled);
+            }
+        }
+
+        let mut deleted = 0;
+        for (id, path) in &sessions {
+            if let Err(e) = delete_session(path) {
+                eprintln!("warning: failed to delete {}: {e}", short_uuid(id));
+            } else {
+                deleted += 1;
+            }
+        }
+
+        let plural = if deleted == 1 { "session" } else { "sessions" };
+        Ok(format!("Deleted {deleted} {plural}").into())
+    });
+}
+
+pub async fn view(args: SessionViewArgs) {
+    let session_id = match args.session {
+        Some(prefix) => match gage_claude::session::one_session(&prefix) {
+            Ok(s) => s.id,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        },
+        None => match pick_session().await {
+            Ok(Some(id)) => id,
+            Ok(None) => return,
+            Err(e) => {
+                eprintln!("gage session view: {e}");
+                std::process::exit(1);
+            }
+        },
+    };
+    if let Err(e) = gage_tui::run(&session_id).await {
+        eprintln!("gage session view: {e}");
+        std::process::exit(1);
+    }
+}
+
+async fn pick_session() -> std::io::Result<Option<String>> {
+    let ctx = gage_query::create_context_default().await;
+    let sql = "SELECT id, project, mtime, title \
+               FROM session ORDER BY mtime DESC LIMIT 30";
+    let batches = run_query(&ctx, sql).await;
+
+    let prefix = home_slug();
+    let mut items: Vec<(String, String, String)> = Vec::new();
+    for batch in &batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let projects = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mtimes = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap();
+        let titles = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            let id = ids.value(i).to_string();
+            let project = projects
+                .value(i)
+                .strip_prefix(&*prefix)
+                .unwrap_or(projects.value(i))
+                .to_string();
+            let age = crate::human::format_elapsed_ms(mtimes.value(i));
+            let title = if titles.is_null(i) || titles.value(i).is_empty() {
+                "(untitled)".to_string()
+            } else {
+                titles.value(i).to_string()
+            };
+            let label = format!("{}  {}", short_uuid(&id), title);
+            let hint = format!("{project} · {age}");
+            items.push((id, label, hint));
+        }
+    }
+
+    if items.is_empty() {
+        println!("No sessions found");
+        return Ok(None);
+    }
+
+    dialog::install_theme();
+    match cli::select("Select a session")
+        .items(&items)
+        .max_rows(15)
+        .filter_mode()
+        .interact()
+    {
+        Ok(id) => Ok(Some(id)),
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Ok(None),
+        Err(e) => Err(e),
+    }
+}

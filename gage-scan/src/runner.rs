@@ -1,0 +1,589 @@
+use std::collections::HashMap;
+use std::fmt;
+use std::io;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use gage_claude::home::ClaudeHome;
+use gage_claude::project::{Project, project_for_session_name};
+use gage_claude::session::SessionInfo;
+use gage_db::rusqlite::Connection;
+use gage_db::scan::{Scan, ScanScanner, insert_scan, insert_scan_session, insert_scanner};
+use rune::alloc::prelude::TryToOwned;
+use rune::runtime::Vm;
+use rune::sync::Arc as RuneArc;
+use rune::{Diagnostics, Source, Sources};
+use tokio_util::sync::CancellationToken;
+
+use crate::event::{RunSummary, ScanEvent};
+use crate::runtime;
+use crate::runtime::state::{RunContext, ScanContext, ScannerSlot, TaskTarget};
+use crate::scanner::{Scanner, ScannerDef, scanners_dir};
+use crate::scheduler;
+
+pub enum RunError {
+    Io(io::Error),
+    Db(gage_db::scan::ScanError),
+    Compile(String),
+    MissingTask { scanner: String, task: String },
+    Plan(String),
+    Emitted,
+    Canceled,
+}
+
+impl fmt::Display for RunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RunError::Io(e) => write!(f, "{e}"),
+            RunError::Db(e) => write!(f, "{e}"),
+            RunError::Compile(name) => write!(f, "scanner '{name}' failed to compile"),
+            RunError::MissingTask { scanner, task } => write!(
+                f,
+                "scanner '{scanner}' declares task '{task}' but defines no matching function"
+            ),
+            RunError::Plan(msg) => write!(f, "plan error: {msg}"),
+            RunError::Emitted => Ok(()),
+            RunError::Canceled => write!(f, "scan canceled"),
+        }
+    }
+}
+
+impl From<io::Error> for RunError {
+    fn from(e: io::Error) -> Self {
+        RunError::Io(e)
+    }
+}
+
+impl From<gage_db::scan::ScanError> for RunError {
+    fn from(e: gage_db::scan::ScanError) -> Self {
+        RunError::Db(e)
+    }
+}
+
+/// Run scanners against the selected sessions.
+///
+/// `db` is the process-wide shared connection. Every ScannerSlot gets
+/// a clone of this Arc; every task read and write goes through this
+/// Mutex. Combined with the scheduler's DAG gating (a downstream task
+/// is only enqueued after the upstream task's worker returns from
+/// dispatch_task, which has already released this Mutex), this is what
+/// makes a `notes.wants` entry mean "sees every note of that name written
+/// by an upstream task." Callers are expected to hold the same Arc so
+/// they can query the resulting notes after the run completes — do not
+/// open a second connection for that, since separate WAL connections
+/// take snapshot reads.
+pub async fn run(
+    db: Arc<Mutex<Connection>>,
+    scanners: Vec<Scanner<'_>>,
+    sessions: Vec<(String, PathBuf)>,
+    jobs: usize,
+    cancel: CancellationToken,
+    on_event: impl FnMut(ScanEvent) + Send,
+) -> Result<RunSummary, RunError> {
+    // Init scan + per-scanner records, recording the selected session ids.
+    let session_ids: Vec<&str> = sessions.iter().map(|(id, _)| id.as_str()).collect();
+    let scan_id = {
+        let conn = db.lock().unwrap();
+        init_run(&scanners, &session_ids, &conn)?
+    };
+
+    // Resolve selected sessions to SessionInfo. The CLI gives us
+    // (id, path); enrich to SessionInfo for the runtime.
+    let selected: Vec<SessionInfo> = sessions
+        .into_iter()
+        .map(|(id, src)| {
+            let meta = std::fs::metadata(&src).ok();
+            let mtime = meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            SessionInfo {
+                id,
+                src,
+                mtime,
+                size,
+            }
+        })
+        .collect();
+
+    // Resolve distinct projects from `~/.claude.json`. Sessions key
+    // off the encoded directory name they were stored under; that
+    // encoding is lossy, so the lookup picks the first project whose
+    // path encodes to the same name. Sessions whose project isn't in
+    // `.claude.json` (e.g. the user deleted the directory) silently
+    // resolve to no project.
+    let claude_home = ClaudeHome::from_env()?;
+    let mut projects: HashMap<String, Arc<Project>> = HashMap::new();
+    for s in &selected {
+        let name = s.project_name().to_string();
+        if projects.contains_key(&name) {
+            continue;
+        }
+        if let Some(p) = project_for_session_name(&claude_home, &name)? {
+            projects.insert(name, Arc::new(p));
+        }
+    }
+
+    let run = Arc::new(RunContext {
+        scan_id: scan_id.clone(),
+        selected: Arc::from(selected.into_boxed_slice()),
+        projects,
+    });
+
+    // Build per-scanner compilation artifacts.
+    let mut slots: Vec<ScannerSlot> = Vec::new();
+    let mut scanner_tasks: Vec<HashMap<String, crate::scanner::TaskDef>> = Vec::new();
+    for s in scanners {
+        let slot = compile_scanner(&s, db.clone())?;
+        verify_tasks(&slot, s.def)?;
+        let tasks: HashMap<String, _> = s
+            .def
+            .tasks
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        slots.push(slot);
+        scanner_tasks.push(tasks);
+    }
+
+    let plan =
+        scheduler::plan(&slots, &scanner_tasks, &run).map_err(|e| RunError::Plan(e.to_string()))?;
+
+    let slots = Arc::new(slots);
+    let result = scheduler::run_plan(plan, slots, run, jobs, cancel, on_event).await;
+
+    match result {
+        Ok(summary) => {
+            if summary.failed > 0 {
+                Err(RunError::Emitted)
+            } else {
+                Ok(summary)
+            }
+        }
+        Err(scheduler::RunError::Channel) => Err(RunError::Emitted),
+        Err(scheduler::RunError::Canceled) => Err(RunError::Canceled),
+    }
+}
+
+fn init_run(
+    scanners: &[Scanner<'_>],
+    session_ids: &[&str],
+    db: &Connection,
+) -> Result<String, RunError> {
+    let scan_id = gage_core::uuid::new_uuid();
+    insert_scan(
+        db,
+        &Scan {
+            id: scan_id.clone(),
+            created: gage_core::datetime::now_ms(),
+            metadata: None,
+        },
+    )?;
+
+    for sid in session_ids {
+        insert_scan_session(db, &scan_id, sid)?;
+    }
+
+    // `scan_scanner` records which scanners ran in this scan (name +
+    // version), surfaced by `gage scan show`. The row id is metadata
+    // only; nothing resolves through it.
+    for scanner in scanners {
+        insert_scanner(
+            db,
+            &ScanScanner {
+                id: gage_core::uuid::new_uuid(),
+                scan_id: scan_id.clone(),
+                scanner_name: scanner.def.name.clone(),
+                scanner_version: scanner.def.version.clone(),
+                metadata: None,
+            },
+        )?;
+    }
+
+    Ok(scan_id)
+}
+
+fn compile_scanner(
+    scanner: &Scanner<'_>,
+    db: Arc<Mutex<Connection>>,
+) -> Result<ScannerSlot, RunError> {
+    let dir = scanners_dir();
+    let scanner_path = dir.join(&scanner.def.embed_key);
+
+    // Build context without rune's default stdio (print/println) so we
+    // can install our own that routes through SCAN_CTX.
+    let mut context = rune_modules::with_config(false).unwrap();
+    context.install(runtime::io_module().unwrap()).unwrap();
+    context.install(runtime::types_module().unwrap()).unwrap();
+    context
+        .install(runtime::macros_module(&scanner.def.embed_key, dir).unwrap())
+        .unwrap();
+    context.install(runtime::gage_module().unwrap()).unwrap();
+    context.install(runtime::stats_module().unwrap()).unwrap();
+    context.install(runtime::json_module().unwrap()).unwrap();
+    let rt = RuneArc::try_new(context.runtime().unwrap()).unwrap();
+
+    let mut sources = Sources::new();
+    sources
+        .insert(Source::with_path(&scanner.def.name, scanner.def.source(), &scanner_path).unwrap())
+        .unwrap();
+
+    let mut diagnostics = Diagnostics::new();
+    let result = rune::prepare(&mut sources)
+        .with_context(&context)
+        .with_diagnostics(&mut diagnostics)
+        .build();
+
+    if !diagnostics.is_empty() {
+        let mut writer =
+            rune::termcolor::StandardStream::stderr(rune::termcolor::ColorChoice::Auto);
+        diagnostics.emit(&mut writer, &sources).unwrap();
+    }
+
+    let unit = match result {
+        Ok(unit) => RuneArc::try_new(unit).unwrap(),
+        Err(_) => return Err(RunError::Compile(scanner.def.name.clone())),
+    };
+
+    Ok(ScannerSlot {
+        name: scanner.def.name.clone(),
+        embed_key: scanner.def.embed_key.clone(),
+        source_path: scanner_path,
+        source: scanner.def.source().to_string(),
+        params: scanner.params.clone(),
+        rt,
+        unit,
+        sources: Arc::new(sources),
+        db,
+        fault: Mutex::new(None),
+    })
+}
+
+// Every declared task must map to a function of the same name in the
+// compiled unit. A missing function is a broken scanner, not a runtime
+// hiccup, so we surface it here before any session is touched rather
+// than letting the scheduler hit "missing entry" mid-scan.
+fn verify_tasks(slot: &ScannerSlot, def: &ScannerDef) -> Result<(), RunError> {
+    let vm = rune::Vm::new(slot.rt.clone(), slot.unit.clone());
+    for task in def.tasks.keys() {
+        match vm.lookup_function([task.as_str()]) {
+            Ok(_) => {}
+            Err(_) => {
+                return Err(RunError::MissingTask {
+                    scanner: slot.name.clone(),
+                    task: task.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+// ============================================================
+// Test scanner harness (preserved from the prior runner).
+// ============================================================
+
+pub async fn test_scanners(scanners: Vec<Scanner<'_>>) -> Result<(), RunError> {
+    let mut failed = false;
+
+    for scanner in scanners {
+        let name = scanner.def.name.clone();
+
+        let dir = scanners_dir();
+        let scanner_path = dir.join(&scanner.def.embed_key);
+
+        let mut context = rune_modules::with_config(false).unwrap();
+        context.install(runtime::io_module().unwrap()).unwrap();
+        context.install(runtime::types_module().unwrap()).unwrap();
+        context
+            .install(runtime::macros_module(&scanner.def.embed_key, dir).unwrap())
+            .unwrap();
+        context.install(runtime::gage_module().unwrap()).unwrap();
+        context.install(runtime::stats_module().unwrap()).unwrap();
+        context.install(runtime::json_module().unwrap()).unwrap();
+        let rt = RuneArc::try_new(context.runtime().unwrap()).unwrap();
+
+        let mut sources = Sources::new();
+        sources
+            .insert(
+                Source::with_path(&scanner.def.name, scanner.def.source(), &scanner_path).unwrap(),
+            )
+            .unwrap();
+
+        let mut test_visitor = TestVisitor::default();
+        let mut diagnostics = Diagnostics::new();
+        let result = rune::prepare(&mut sources)
+            .with_context(&context)
+            .with_diagnostics(&mut diagnostics)
+            .with_visitor(&mut test_visitor)
+            .unwrap()
+            .build();
+
+        if !diagnostics.is_empty() {
+            let mut writer =
+                rune::termcolor::StandardStream::stderr(rune::termcolor::ColorChoice::Auto);
+            diagnostics.emit(&mut writer, &sources).unwrap();
+        }
+
+        let unit = match result {
+            Ok(unit) => RuneArc::try_new(unit).unwrap(),
+            Err(_) => {
+                failed = true;
+                continue;
+            }
+        };
+
+        let tests = test_visitor.into_functions();
+        if tests.is_empty() {
+            tracing::warn!("{name}: no #[test] functions found");
+            continue;
+        }
+
+        // Tests run with a stub ScanContext — session()/etc.
+        // return None, sessions() is empty.
+        let stub_run = Arc::new(RunContext {
+            scan_id: "test".to_string(),
+            selected: Arc::from(Vec::<SessionInfo>::new().into_boxed_slice()),
+            projects: HashMap::new(),
+        });
+        let stub_db = Arc::new(Mutex::new(gage_db::db::open_db_in_memory()));
+        let (stub_tx, _stub_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        for (hash, item) in &tests {
+            let mut vm = Vm::new(rt.clone(), unit.clone());
+            let ctx = Arc::new(ScanContext {
+                scanner_name: name.clone(),
+                params: scanner.params.clone(),
+                run: stub_run.clone(),
+                target: TaskTarget::Scan,
+                df_ctx: None,
+                db: stub_db.clone(),
+                runtime_tx: stub_tx.clone(),
+            });
+            let result = runtime::state::SCAN_CTX
+                .scope(ctx, async move {
+                    vm.execute(*hash, ()).unwrap().async_complete().await
+                })
+                .await;
+            match result {
+                Err(e) => {
+                    let raw = e.to_string();
+                    let detail = raw.strip_prefix("Panicked: ").unwrap_or(&raw);
+                    let msg = format!("{name}::{item} failed: {detail}");
+                    emit_vm_error_with_message(&e, &sources, &msg);
+                    failed = true;
+                }
+                Ok(value) => {
+                    match rune::from_value::<Result<rune::runtime::Value, rune::runtime::Value>>(
+                        value,
+                    ) {
+                        Ok(Err(err)) if !runtime::ignore::is_ignore(&err) => {
+                            emit_scanner_err(&name, &item.to_string(), "returned Err(...)");
+                            failed = true;
+                        }
+                        _ => emit_test_pass(&format!("{name}::{item}")),
+                    }
+                }
+            }
+        }
+    }
+
+    if failed {
+        Err(RunError::Emitted)
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct TestVisitor {
+    functions: Vec<(rune::Hash, rune::ItemBuf)>,
+}
+
+impl TestVisitor {
+    fn into_functions(self) -> Vec<(rune::Hash, rune::ItemBuf)> {
+        self.functions
+    }
+}
+
+impl rune::compile::CompileVisitor for TestVisitor {
+    fn register_meta(
+        &mut self,
+        meta: rune::compile::MetaRef<'_>,
+    ) -> Result<(), rune::compile::MetaError> {
+        if let rune::compile::meta::Kind::Function { is_test: true, .. } = meta.kind {
+            self.functions
+                .push((meta.hash, meta.item.try_to_owned().unwrap()));
+        }
+        Ok(())
+    }
+}
+
+fn emit_test_pass(scanner_name: &str) {
+    use rune::termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
+    use std::io::Write;
+
+    let mut stderr = StandardStream::stderr(ColorChoice::Auto);
+    #[allow(clippy::let_underscore_must_use)]
+    let _ = (|| -> std::io::Result<()> {
+        stderr.set_color(
+            ColorSpec::new()
+                .set_fg(Some(Color::Green))
+                .set_intense(true),
+        )?;
+        write!(stderr, "pass")?;
+        stderr.reset()?;
+        writeln!(stderr, ": {scanner_name}")
+    })();
+}
+
+fn emit_scanner_err(scanner_name: &str, func: &str, detail: &str) {
+    use rune::termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
+    use std::io::Write;
+
+    let mut stderr = StandardStream::stderr(ColorChoice::Auto);
+    #[allow(clippy::let_underscore_must_use)]
+    let _ = (|| -> std::io::Result<()> {
+        stderr.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
+        write!(stderr, "error")?;
+        stderr.set_color(ColorSpec::new().set_bold(true))?;
+        write!(stderr, ": {scanner_name} {func}() failed: {detail}")?;
+        stderr.reset()?;
+        writeln!(stderr)
+    })();
+}
+
+fn emit_vm_error_with_message(e: &rune::runtime::VmError, sources: &Sources, msg: &str) {
+    use rune::termcolor::{ColorChoice, StandardStream};
+
+    let mut writer = StandardStream::stderr(ColorChoice::Auto);
+    write_vm_error(&mut writer, e, sources, msg);
+}
+
+pub(crate) fn render_vm_error(e: &rune::runtime::VmError, sources: &Sources, msg: &str) -> String {
+    let mut buf = rune::termcolor::Buffer::ansi();
+    write_vm_error(&mut buf, e, sources, msg);
+    String::from_utf8(buf.into_inner()).unwrap()
+}
+
+fn write_vm_error<W: rune::termcolor::WriteColor>(
+    w: &mut W,
+    e: &rune::runtime::VmError,
+    sources: &Sources,
+    msg: &str,
+) {
+    use codespan_reporting::diagnostic::{Diagnostic, Label};
+    use codespan_reporting::term;
+
+    let config = term::Config::default();
+
+    if let Some(loc) = e.first_location()
+        && let Some(debug_info) = loc.unit.debug_info()
+        && let Some(inst) = debug_info.instruction_at(loc.ip)
+    {
+        let diagnostic = Diagnostic::error().with_message(msg).with_labels(vec![
+            Label::primary(inst.source_id, inst.span.range()).with_message(msg),
+        ]);
+
+        term::emit_to_write_style(w, &config, sources, &diagnostic).unwrap();
+    } else {
+        writeln!(w, "error: {msg}").unwrap();
+    }
+}
+
+// Public TestRuntime preserved for external tests (gage-scan/tests/*).
+pub struct TestRuntime {
+    embed_key: String,
+    scanners_dir: PathBuf,
+}
+
+impl Default for TestRuntime {
+    fn default() -> Self {
+        Self {
+            embed_key: String::new(),
+            scanners_dir: scanners_dir(),
+        }
+    }
+}
+
+impl TestRuntime {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_embed_key(embed_key: &str) -> Self {
+        Self {
+            embed_key: embed_key.to_string(),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_scanners_dir(embed_key: &str, scanners_dir: PathBuf) -> Self {
+        Self {
+            embed_key: embed_key.to_string(),
+            scanners_dir,
+        }
+    }
+
+    pub fn macros_module(&self) -> Result<rune::Module, rune::ContextError> {
+        runtime::macros_module(&self.embed_key, self.scanners_dir.clone())
+    }
+
+    pub fn gage_module(&self) -> Result<rune::Module, rune::ContextError> {
+        runtime::gage_module()
+    }
+
+    pub fn types_module(&self) -> Result<rune::Module, rune::ContextError> {
+        runtime::types_module()
+    }
+
+    pub fn test_helpers_module(&self) -> Result<rune::Module, rune::ContextError> {
+        use rune::runtime::{Object, Value};
+
+        let mut m = rune::Module::with_crate("test")?;
+        m.function("make_message", |obj: Object| -> Value {
+            rune::to_value(runtime::query::Message {
+                inner: obj,
+                object: std::sync::OnceLock::new(),
+            })
+            .unwrap()
+        })
+        .build()?;
+        m.function("make_entry", |obj: Object| -> Value {
+            rune::to_value(runtime::query::Entry {
+                inner: obj,
+                object: std::sync::OnceLock::new(),
+            })
+            .unwrap()
+        })
+        .build()?;
+        Ok(m)
+    }
+
+    /// Enter a scan-context scope for tests that exercise runtime APIs
+    /// requiring `current_scan_ctx()`. The provided closure runs with
+    /// the SCAN_CTX task-local installed.
+    pub async fn with_scope<F, Fut, T>(&self, f: F) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let run = Arc::new(RunContext {
+            scan_id: "test".to_string(),
+            selected: Arc::from(Vec::<SessionInfo>::new().into_boxed_slice()),
+            projects: HashMap::new(),
+        });
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = Arc::new(ScanContext {
+            scanner_name: "test".to_string(),
+            params: None,
+            run,
+            target: TaskTarget::Scan,
+            df_ctx: None,
+            db: Arc::new(Mutex::new(gage_db::db::open_db_in_memory())),
+            runtime_tx: tx,
+        });
+        runtime::state::SCAN_CTX.scope(ctx, f()).await
+    }
+}

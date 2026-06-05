@@ -1,0 +1,430 @@
+pub(crate) mod anthropic;
+
+use std::collections::VecDeque;
+use std::sync::Mutex;
+
+use rune::alloc::fmt::TryWrite;
+use rune::alloc::prelude::TryClone;
+use rune::runtime::{Formatter, FromValue, Object, Ref, Value, VmError};
+use rune::{Any, ContextError, Module};
+use serde_json as json;
+use tracing::debug;
+
+use crate::runtime::error::Error;
+use crate::runtime::value::json_to_object;
+
+use anthropic::{
+    CacheControl, Client, ContentBlock, HttpClient, LlmError, Message as ApiMessage,
+    MessagesRequest, Role, StopReason as ApiStopReason, SystemBlock, ToolDef,
+};
+
+const DEFAULT_MODEL: &str = "sonnet";
+const DEFAULT_MAX_ROUNDS: u32 = 8;
+const DEFAULT_MAX_TOKENS: u32 = 4096;
+const DEFAULT_SYSTEM_PROMPT: &str = "You are an analysis tool. Use the provided tools to report \
+    findings. When done, return without calling further tools.";
+
+#[derive(Clone, Copy, Any)]
+#[rune(item = ::gage)]
+pub(crate) enum StopReason {
+    #[rune(constructor)]
+    EndTurn,
+    #[rune(constructor)]
+    MaxTokens,
+    #[rune(constructor)]
+    StopSequence,
+    #[rune(constructor)]
+    PauseTurn,
+    #[rune(constructor)]
+    Refusal,
+    #[rune(constructor)]
+    MaxRounds,
+}
+
+impl StopReason {
+    fn label(&self) -> &'static str {
+        match self {
+            StopReason::EndTurn => "EndTurn",
+            StopReason::MaxTokens => "MaxTokens",
+            StopReason::StopSequence => "StopSequence",
+            StopReason::PauseTurn => "PauseTurn",
+            StopReason::Refusal => "Refusal",
+            StopReason::MaxRounds => "MaxRounds",
+        }
+    }
+
+    #[rune::function(protocol = DEBUG_FMT)]
+    fn debug(&self, f: &mut Formatter) -> Result<(), VmError> {
+        write!(f, "{}", self.label())?;
+        Ok(())
+    }
+}
+
+impl TryClone for StopReason {
+    fn try_clone(&self) -> Result<Self, rune::alloc::Error> {
+        Ok(*self)
+    }
+}
+
+#[derive(Any)]
+#[rune(item = ::gage)]
+pub(crate) enum PollResult {
+    #[rune(constructor)]
+    Tool(#[rune(get)] Value, #[rune(get)] Value, #[rune(get)] Value),
+    #[rune(constructor)]
+    Text(#[rune(get)] Value),
+    #[rune(constructor)]
+    Stop(#[rune(get)] StopReason),
+}
+
+impl PollResult {
+    #[rune::function(protocol = DEBUG_FMT)]
+    fn debug(&self, f: &mut Formatter) -> Result<(), VmError> {
+        match self {
+            PollResult::Tool(name, _, _) => write!(f, "Tool({name:?})")?,
+            PollResult::Text(text) => write!(f, "Text({text:?})")?,
+            PollResult::Stop(reason) => write!(f, "Stop({})", reason.label())?,
+        }
+        Ok(())
+    }
+}
+
+struct SessionInner {
+    client: std::sync::Arc<HttpClient>,
+    model: String,
+    max_tokens: u32,
+    max_rounds: u32,
+    system: Vec<SystemBlock>,
+    tool_defs: Vec<ToolDef>,
+    messages: Vec<ApiMessage>,
+    pending_blocks: VecDeque<ContentBlock>,
+    pending_tool_results: Vec<ContentBlock>,
+    api_stop_reason: Option<ApiStopReason>,
+    round: u32,
+    is_active: bool,
+}
+
+#[derive(Any)]
+#[rune(item = ::gage)]
+pub(crate) struct LlmSession {
+    #[rune(skip)]
+    inner: std::sync::Arc<Mutex<SessionInner>>,
+}
+
+impl LlmSession {
+    #[rune::function(instance)]
+    fn active(&self) -> bool {
+        self.inner.lock().unwrap().is_active
+    }
+
+    #[rune::function(instance)]
+    fn tool_result(&self, id: String, result: Value) {
+        let (content, is_error) = interpret_tool_result(result);
+        self.inner
+            .lock()
+            .unwrap()
+            .pending_tool_results
+            .push(ContentBlock::ToolResult {
+                tool_use_id: id,
+                content,
+                is_error,
+            });
+    }
+}
+
+#[rune::function(instance)]
+async fn poll(session: Ref<LlmSession>) -> super::Result<PollResult> {
+    let inner = session.inner.clone();
+    do_poll(inner).await
+}
+
+async fn do_poll(inner: std::sync::Arc<Mutex<SessionInner>>) -> super::Result<PollResult> {
+    {
+        let mut state = inner.lock().unwrap();
+        if let Some(block) = state.pending_blocks.pop_front() {
+            return Ok(to_poll_result(block));
+        }
+        if state.api_stop_reason != Some(ApiStopReason::ToolUse) {
+            state.is_active = false;
+            return Ok(PollResult::Stop(to_stop_reason(state.api_stop_reason)));
+        }
+        if state.round >= state.max_rounds {
+            state.is_active = false;
+            return Ok(PollResult::Stop(StopReason::MaxRounds));
+        }
+    }
+
+    send_next_round(&inner).await?;
+
+    let mut state = inner.lock().unwrap();
+    if let Some(block) = state.pending_blocks.pop_front() {
+        return Ok(to_poll_result(block));
+    }
+    state.is_active = false;
+    Ok(PollResult::Stop(to_stop_reason(state.api_stop_reason)))
+}
+
+async fn send_next_round(inner: &std::sync::Arc<Mutex<SessionInner>>) -> super::Result<()> {
+    let (client, req) = {
+        let mut state = inner.lock().unwrap();
+        let results = std::mem::take(&mut state.pending_tool_results);
+        state.messages.push(ApiMessage {
+            role: Role::User,
+            content: results,
+        });
+        state.round += 1;
+
+        let req = MessagesRequest {
+            model: state.model.clone(),
+            max_tokens: state.max_tokens,
+            system: state.system.clone(),
+            messages: state.messages.clone(),
+            tools: state.tool_defs.clone(),
+        };
+        (state.client.clone(), req)
+    };
+
+    let resp = client.messages(&req).await?;
+
+    let mut state = inner.lock().unwrap();
+    debug!(
+        round = state.round,
+        stop_reason = ?resp.stop_reason,
+        input_tokens = resp.usage.input_tokens,
+        output_tokens = resp.usage.output_tokens,
+        "call_llm round"
+    );
+    state.messages.push(ApiMessage {
+        role: Role::Assistant,
+        content: resp.content.clone(),
+    });
+    state.pending_blocks = resp.content.into_iter().collect();
+    state.api_stop_reason = Some(resp.stop_reason);
+
+    Ok(())
+}
+
+pub(crate) fn register(m: &mut Module) -> Result<(), ContextError> {
+    m.ty::<StopReason>()?;
+    m.function_meta(StopReason::debug)?;
+    m.ty::<PollResult>()?;
+    m.function_meta(PollResult::debug)?;
+    m.ty::<LlmSession>()?;
+
+    m.function_meta(LlmSession::active)?;
+    m.function_meta(LlmSession::tool_result)?;
+    m.function_meta(poll)?;
+
+    m.function("call_llm", |prompt: String, opts: Object| async move {
+        do_call_llm(prompt, opts).await
+    })
+    .build()?;
+
+    Ok(())
+}
+
+async fn do_call_llm(prompt: String, opts: Object) -> super::Result<LlmSession> {
+    let model_alias = opts
+        .get("model")
+        .and_then(|v| v.borrow_string_ref().ok().map(|s| s.to_string()))
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let model = anthropic::resolve_model(&model_alias).to_string();
+
+    let max_rounds = opts
+        .get("max_rounds")
+        .and_then(|v| i64::from_value(v.clone()).ok())
+        .map(|v| v as u32)
+        .unwrap_or(DEFAULT_MAX_ROUNDS);
+
+    let tool_defs = parse_tools(&opts);
+    let client = std::sync::Arc::new(HttpClient::from_env()?);
+
+    let system_text = opts
+        .get("system_prompt")
+        .and_then(|v| v.borrow_string_ref().ok().map(|s| s.to_string()))
+        .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
+    let system = vec![SystemBlock::text_cached(system_text)];
+
+    let messages = vec![ApiMessage {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: prompt,
+            cache_control: Some(CacheControl::ephemeral()),
+        }],
+    }];
+
+    debug!(model = model.as_str(), tools = tool_defs.len(), "call_llm");
+
+    let req = MessagesRequest {
+        model: model.clone(),
+        max_tokens: DEFAULT_MAX_TOKENS,
+        system: system.clone(),
+        messages: messages.clone(),
+        tools: tool_defs.clone(),
+    };
+
+    let resp = client.messages(&req).await?;
+
+    debug!(
+        round = 1,
+        stop_reason = ?resp.stop_reason,
+        input_tokens = resp.usage.input_tokens,
+        output_tokens = resp.usage.output_tokens,
+        "call_llm round"
+    );
+
+    let mut all_messages = messages;
+    all_messages.push(ApiMessage {
+        role: Role::Assistant,
+        content: resp.content.clone(),
+    });
+
+    let pending_blocks: VecDeque<ContentBlock> = resp.content.into_iter().collect();
+    let is_active = !pending_blocks.is_empty() || resp.stop_reason == ApiStopReason::ToolUse;
+
+    Ok(LlmSession {
+        inner: std::sync::Arc::new(Mutex::new(SessionInner {
+            client,
+            model,
+            max_tokens: DEFAULT_MAX_TOKENS,
+            max_rounds,
+            system,
+            tool_defs,
+            messages: all_messages,
+            pending_blocks,
+            pending_tool_results: Vec::new(),
+            api_stop_reason: Some(resp.stop_reason),
+            round: 1,
+            is_active,
+        })),
+    })
+}
+
+fn parse_tools(opts: &Object) -> Vec<ToolDef> {
+    let tools_val = match opts.get("tools") {
+        Some(v) => v.clone(),
+        None => return Vec::new(),
+    };
+
+    let tools_obj: Object = rune::from_value(tools_val).expect("call_llm: tools must be an object");
+
+    let mut result = Vec::new();
+    for (name, val) in tools_obj.iter() {
+        let tool_obj: Object = rune::from_value(val.clone())
+            .unwrap_or_else(|_| panic!("call_llm: tool '{name}' must be an object"));
+
+        let description = tool_obj
+            .get("description")
+            .and_then(|v| v.borrow_string_ref().ok().map(|s| s.to_string()))
+            .unwrap_or_default();
+
+        let input_schema = parse_tool_inputs(&tool_obj);
+
+        result.push(ToolDef {
+            name: name.to_string(),
+            description,
+            input_schema,
+        });
+    }
+    result
+}
+
+fn parse_tool_inputs(tool: &Object) -> json::Value {
+    let inputs_val = match tool.get("inputs") {
+        Some(v) => v.clone(),
+        None => return json::json!({"type": "object", "properties": {}}),
+    };
+
+    let inputs: Vec<Value> = rune::from_value(inputs_val).unwrap_or_default();
+    let mut properties = json::Map::new();
+    let mut required = Vec::new();
+
+    for input_val in &inputs {
+        let input_obj: Object =
+            rune::from_value(input_val.clone()).expect("call_llm: tool input must be an object");
+
+        let name = input_obj
+            .get("name")
+            .and_then(|v| v.borrow_string_ref().ok().map(|s| s.to_string()))
+            .expect("call_llm: tool input missing 'name'");
+
+        let type_str = input_obj
+            .get("type")
+            .and_then(|v| v.borrow_string_ref().ok().map(|s| s.to_string()))
+            .unwrap_or_else(|| "string".to_string());
+
+        let mut prop = json::Map::new();
+        prop.insert("type".into(), json::Value::String(type_str));
+        if let Some(desc_val) = input_obj.get("description")
+            && let Ok(desc) = desc_val.borrow_string_ref()
+        {
+            prop.insert("description".into(), json::Value::String(desc.to_string()));
+        }
+
+        properties.insert(name.clone(), json::Value::Object(prop));
+        required.push(json::Value::String(name));
+    }
+
+    json::json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+    })
+}
+
+fn to_poll_result(block: ContentBlock) -> PollResult {
+    match block {
+        ContentBlock::ToolUse { id, name, input } => {
+            let args_obj = match input {
+                json::Value::Object(_) => json_to_object(&input),
+                _ => Object::new(),
+            };
+            PollResult::Tool(
+                rune::to_value(name).unwrap(),
+                rune::to_value(args_obj).unwrap(),
+                rune::to_value(id).unwrap(),
+            )
+        }
+        ContentBlock::Text { text, .. } => PollResult::Text(rune::to_value(text).unwrap()),
+        ContentBlock::ToolResult { .. } => PollResult::Text(rune::to_value(String::new()).unwrap()),
+    }
+}
+
+fn to_stop_reason(reason: Option<ApiStopReason>) -> StopReason {
+    match reason {
+        Some(ApiStopReason::EndTurn) | None => StopReason::EndTurn,
+        Some(ApiStopReason::MaxTokens) => StopReason::MaxTokens,
+        Some(ApiStopReason::StopSequence) => StopReason::StopSequence,
+        Some(ApiStopReason::PauseTurn) => StopReason::PauseTurn,
+        Some(ApiStopReason::Refusal) => StopReason::Refusal,
+        Some(ApiStopReason::ToolUse) => StopReason::EndTurn,
+    }
+}
+
+fn interpret_tool_result(result: Value) -> (String, bool) {
+    match rune::from_value::<Result<Value, Value>>(result.clone()) {
+        Ok(Ok(v)) => (value_to_string(&v), false),
+        Ok(Err(v)) => (value_to_string(&v), true),
+        Err(_) => (value_to_string(&result), false),
+    }
+}
+
+fn value_to_string(v: &Value) -> String {
+    v.borrow_string_ref()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|_| "ok".to_string())
+}
+
+impl From<LlmError> for Error {
+    fn from(e: LlmError) -> Self {
+        match e {
+            LlmError::Config(msg) => Error::Config(msg),
+            LlmError::Network(msg) => Error::Network(msg),
+            LlmError::Http { status, body } => Error::Http {
+                status: i64::from(status),
+                body,
+            },
+            LlmError::Decode(msg) => Error::Decode(msg),
+        }
+    }
+}

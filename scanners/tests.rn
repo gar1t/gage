@@ -1,0 +1,51 @@
+#[test]
+fn test_random_f64() {
+    let x = rand::rng().random::<f64>();
+    assert!(x >= 0.0 && x < 1.0, "{}", x);
+}
+
+#[test]
+fn test_vec_map() {
+    let v = [1, 2, 3];
+    // As with Rust, vectors don't support `.map()` directly
+    let v2 = v.iter().map(|x| x + 1).collect::<Vec>();
+    assert_eq!(v2, [2, 3, 4]);
+}
+
+#[test]
+fn test_vec_join() {
+    let v = ["a", "b", "c"];
+    let joined = v.join(", ");
+    assert_eq!(joined, "a, b, c");
+}
+
+#[test]
+fn test_stats_mean() {
+    assert_eq!(stats::mean([1, 2, 3]), Some(2.0));
+    assert_eq!(stats::mean([1, 2.5, 4]), Some(2.5));
+    assert_eq!(stats::mean([]), None);
+    assert_eq!(stats::mean(#{ a: 2, b: 4 }.values()), Some(3.0));
+}
+
+#[test]
+fn test_vec_combine() {
+    // extend in place
+    let a = [1];
+    let b = [2];
+    a.extend(b);
+    assert_eq!(a, [1, 2]);
+
+    // extend new
+    let a = [1];
+    let b = [2];
+    let c = [];
+    c.extend(a);
+    c.extend(b);
+    assert_eq!(c, [1, 2]);
+
+    // chain
+    let a = [1];
+    let b = [2];
+    let c = a.iter().chain(b).collect::<Vec>();
+    assert_eq!(c, [1, 2]);
+}

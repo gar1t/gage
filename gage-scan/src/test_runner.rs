@@ -1,0 +1,271 @@
+use std::collections::HashMap;
+use std::io;
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+use gage_claude::session::SessionInfo;
+use rune::alloc::prelude::TryToOwned;
+use rune::runtime::Vm;
+use rune::sync::Arc as RuneArc;
+use rune::{Diagnostics, Source, Sources};
+
+use crate::runtime;
+use crate::runtime::state::{RunContext, SCAN_CTX, ScanContext, TaskTarget};
+use crate::scanner::{extract_scanners, scanners_dir};
+
+pub enum TestOutcome {
+    Pass,
+    Fail(String),
+}
+
+pub struct TestResult {
+    pub name: String,
+    pub outcome: TestOutcome,
+}
+
+pub struct TestSummary {
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub filtered: usize,
+    pub build_errors: usize,
+}
+
+pub async fn run_tests(
+    filters: &[String],
+    fail_fast: bool,
+    mut on_result: impl FnMut(&TestResult),
+) -> io::Result<TestSummary> {
+    extract_scanners().unwrap();
+    let dir = scanners_dir();
+    let rn_files = walk_rn_files(&dir);
+
+    let mut summary = TestSummary {
+        total: 0,
+        passed: 0,
+        failed: 0,
+        filtered: 0,
+        build_errors: 0,
+    };
+
+    // Build the context once and reuse it for every file. The std library
+    // and native modules are identical across files; only the base directory
+    // the include_* macros resolve against varies, so it lives in a shared
+    // cell updated per file rather than baked into a per-file context
+    let macro_base = runtime::base_dir("");
+    let mut context = rune_modules::with_config(false).unwrap();
+    context.install(runtime::io_module().unwrap()).unwrap();
+    context.install(runtime::types_module().unwrap()).unwrap();
+    context
+        .install(runtime::macros_module_shared(macro_base.clone(), dir.clone()).unwrap())
+        .unwrap();
+    context.install(runtime::gage_module().unwrap()).unwrap();
+    context.install(runtime::stats_module().unwrap()).unwrap();
+    context.install(runtime::json_module().unwrap()).unwrap();
+    let rt = RuneArc::try_new(context.runtime().unwrap()).unwrap();
+
+    for path in &rn_files {
+        let rel = path
+            .strip_prefix(&dir)
+            .expect("path under dir via walk_rn_files")
+            .to_string_lossy()
+            .to_string();
+
+        let code = std::fs::read_to_string(path)?;
+
+        runtime::set_base_dir(&macro_base, &rel);
+
+        let mut sources = Sources::new();
+        sources
+            .insert(Source::with_path(&rel, &code, path).unwrap())
+            .unwrap();
+
+        let mut test_visitor = TestVisitor::default();
+        let mut diagnostics = Diagnostics::new();
+        let result = rune::prepare(&mut sources)
+            .with_context(&context)
+            .with_diagnostics(&mut diagnostics)
+            .with_visitor(&mut test_visitor)
+            .unwrap()
+            .build();
+
+        if !diagnostics.is_empty() {
+            let mut writer =
+                rune::termcolor::StandardStream::stderr(rune::termcolor::ColorChoice::Auto);
+            diagnostics.emit(&mut writer, &sources).unwrap();
+        }
+
+        let unit = match result {
+            Ok(unit) => RuneArc::try_new(unit).unwrap(),
+            Err(_) => {
+                summary.build_errors += 1;
+                continue;
+            }
+        };
+
+        let tests = test_visitor.into_functions();
+        if tests.is_empty() {
+            continue;
+        }
+
+        let stem = path.file_stem().unwrap().to_string_lossy();
+        let module_name = if stem == "scanner" {
+            path.parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| stem.to_string())
+        } else {
+            stem.to_string()
+        };
+
+        let stub_run = std::sync::Arc::new(RunContext {
+            scan_id: "test".to_string(),
+            selected: std::sync::Arc::from(Vec::<SessionInfo>::new().into_boxed_slice()),
+            projects: HashMap::new(),
+        });
+        let stub_db = std::sync::Arc::new(Mutex::new(gage_db::db::open_db_in_memory()));
+        let (stub_tx, _stub_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        for (hash, item) in &tests {
+            let test_name = format!("{module_name}::{item}");
+
+            if !matches_filter(&test_name, filters) {
+                summary.filtered += 1;
+                continue;
+            }
+
+            summary.total += 1;
+
+            let mut vm = Vm::new(rt.clone(), unit.clone());
+            let ctx = std::sync::Arc::new(ScanContext {
+                scanner_name: module_name.clone(),
+                params: None,
+                run: stub_run.clone(),
+                target: TaskTarget::Scan,
+                df_ctx: None,
+                db: stub_db.clone(),
+                runtime_tx: stub_tx.clone(),
+            });
+            let hash = *hash;
+            let result = SCAN_CTX
+                .scope(ctx, async move {
+                    vm.execute(hash, ()).unwrap().async_complete().await
+                })
+                .await;
+            let outcome = match result {
+                Err(e) => {
+                    let raw = e.to_string();
+                    let detail = raw.strip_prefix("Panicked: ").unwrap_or(&raw);
+                    let report = format_error(&test_name, detail, &e, &sources);
+                    TestOutcome::Fail(report)
+                }
+                Ok(value) => {
+                    if let Ok(Err(_err)) = rune::from_value::<
+                        Result<rune::runtime::Value, rune::runtime::Value>,
+                    >(value)
+                    {
+                        TestOutcome::Fail(format!("{test_name} failed: returned Err(...)"))
+                    } else {
+                        TestOutcome::Pass
+                    }
+                }
+            };
+
+            match &outcome {
+                TestOutcome::Pass => summary.passed += 1,
+                TestOutcome::Fail(_) => summary.failed += 1,
+            }
+
+            let is_fail = matches!(&outcome, TestOutcome::Fail(_));
+            on_result(&TestResult {
+                name: test_name,
+                outcome,
+            });
+
+            if fail_fast && is_fail {
+                return Ok(summary);
+            }
+        }
+    }
+
+    Ok(summary)
+}
+
+fn matches_filter(name: &str, filters: &[String]) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    filters.iter().any(|f| name.contains(f.as_str()))
+}
+
+fn format_error(
+    name: &str,
+    detail: &str,
+    error: &rune::runtime::VmError,
+    sources: &Sources,
+) -> String {
+    use codespan_reporting::diagnostic::{Diagnostic, Label};
+    use codespan_reporting::term;
+
+    if let Some(loc) = error.first_location()
+        && let Some(debug_info) = loc.unit.debug_info()
+        && let Some(inst) = debug_info.instruction_at(loc.ip)
+    {
+        let msg = format!("{name} failed: {detail}");
+        let diagnostic = Diagnostic::error().with_message(&msg).with_labels(vec![
+            Label::primary(inst.source_id, inst.span.range()).with_message(&msg),
+        ]);
+        let mut buf = Vec::new();
+        let config = term::Config::default();
+        term::emit_to_io_write(&mut buf, &config, sources, &diagnostic).unwrap();
+        String::from_utf8(buf).unwrap()
+    } else {
+        format!("error: {name} failed: {detail}")
+    }
+}
+
+fn walk_rn_files(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut result = Vec::new();
+    walk_rn_files_rec(dir, &mut result);
+    result.sort();
+    result
+}
+
+fn walk_rn_files_rec(dir: &std::path::Path, result: &mut Vec<PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_rn_files_rec(&path, result);
+        } else if path.extension().is_some_and(|ext| ext == "rn") {
+            result.push(path);
+        }
+    }
+}
+
+#[derive(Default)]
+struct TestVisitor {
+    functions: Vec<(rune::Hash, rune::ItemBuf)>,
+}
+
+impl TestVisitor {
+    fn into_functions(self) -> Vec<(rune::Hash, rune::ItemBuf)> {
+        self.functions
+    }
+}
+
+impl rune::compile::CompileVisitor for TestVisitor {
+    fn register_meta(
+        &mut self,
+        meta: rune::compile::MetaRef<'_>,
+    ) -> Result<(), rune::compile::MetaError> {
+        if let rune::compile::meta::Kind::Function { is_test: true, .. } = meta.kind {
+            self.functions
+                .push((meta.hash, meta.item.try_to_owned().unwrap()));
+        }
+        Ok(())
+    }
+}

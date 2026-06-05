@@ -1,0 +1,499 @@
+use std::io;
+
+use clap::{Args, Subcommand};
+use cliclack as cli;
+use gage_claude::session::one_session;
+use gage_core::text_resolve::TextResolver;
+use gage_core::uuid::short_uuid;
+use gage_db::db;
+use gage_db::note::{self, Note, NoteFilters};
+use gage_db::note_relation::insert_relation;
+use gage_db::target::{NoteTarget, SessionTarget};
+use gage_scan::scanner::ScannerRegistry;
+use gage_scan::scanner_scheme::{ErrorScheme, ScannerScheme};
+use tabled::{
+    Table,
+    settings::{
+        Color, Style, Width,
+        object::{Columns, Object, Rows},
+        peaker::PriorityMax,
+    },
+};
+
+use crate::author::resolve_author;
+use crate::dialog::{self, DialogError};
+use crate::style;
+
+#[derive(Subcommand)]
+pub enum NoteCommand {
+    /// List notes
+    List(NoteListArgs),
+    /// Add a note
+    Add(NoteAddArgs),
+    /// Comment on a note
+    Comment(NoteCommentArgs),
+    /// Show a note
+    Show(NoteShowArgs),
+    /// Edit a note
+    Edit(NoteEditArgs),
+    /// Delete notes
+    Delete(NoteDeleteArgs),
+}
+
+#[derive(Args)]
+pub struct NoteListArgs {
+    #[command(flatten)]
+    limit: crate::limit::LimitArgs,
+
+    /// Filter by session ID (prefix match)
+    #[arg(short, long)]
+    session: Option<String>,
+    /// Filter by note name
+    #[arg(short, long)]
+    name: Option<String>,
+}
+
+#[derive(Args)]
+pub struct NoteAddArgs {
+    /// Target reference (e.g. session-id, session-id:42, session-id:42-50)
+    #[arg(short, long)]
+    target: Option<String>,
+    /// Note name (default: comment)
+    #[arg(short, long)]
+    name: Option<String>,
+    /// Note value (prompted if omitted)
+    #[arg(short, long)]
+    value: Option<String>,
+    /// Author username (default: $USER)
+    #[arg(short, long)]
+    user: Option<String>,
+}
+
+#[derive(Args)]
+pub struct NoteCommentArgs {
+    /// Target note UUID (or prefix)
+    id: String,
+    /// Comment message (prompted if omitted)
+    #[arg(short)]
+    msg: Option<String>,
+    /// Skip confirmation prompt
+    #[arg(short, long)]
+    yes: bool,
+}
+
+#[derive(Args)]
+pub struct NoteShowArgs {
+    /// Note UUID (or prefix)
+    id: String,
+
+    /// Show target content
+    #[arg(short = 't', long = "target")]
+    target_content: bool,
+}
+
+#[derive(Args)]
+pub struct NoteEditArgs {
+    /// Note UUID (or prefix)
+    id: String,
+    /// New value (prompted if omitted)
+    #[arg(short, long)]
+    value: Option<String>,
+}
+
+#[derive(Args)]
+pub struct NoteDeleteArgs {
+    /// Note UUIDs (prefix match)
+    ids: Vec<String>,
+    /// Skip confirmation prompt
+    #[arg(short, long)]
+    yes: bool,
+}
+
+pub fn list(args: NoteListArgs) {
+    let conn = db::open_db();
+    let session = match args.session {
+        Some(prefix) => match one_session(&prefix) {
+            Ok(s) => Some(s.id),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+    let filters = NoteFilters {
+        session,
+        name: args.name,
+        ..Default::default()
+    };
+    let notes = match note::find(&conn, &filters) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let total = notes.len();
+    if total == 0 {
+        println!("No notes found");
+        return;
+    }
+
+    let show = args.limit.show_count(total);
+
+    let header: Vec<String> = ["Id", "Name", "Value", "Target", "Created"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    let rows: Vec<Vec<String>> = notes
+        .iter()
+        .take(show)
+        .map(|n| {
+            vec![
+                short_uuid(&n.id).to_string(),
+                n.name.clone(),
+                n.value.to_json(),
+                shorten_target(&n.target),
+                crate::human::format_elapsed_ms(n.created),
+            ]
+        })
+        .collect();
+
+    let term_width = console::Term::stdout().size().1 as usize;
+    let table = Table::from_iter(std::iter::once(header).chain(rows))
+        .with(Style::rounded())
+        .with(
+            Width::truncate(term_width)
+                .suffix("…")
+                .priority(PriorityMax::left()),
+        )
+        .modify(Rows::first(), Color::FG_BRIGHT_YELLOW)
+        .modify(Columns::first().not(Rows::first()), Color::FG_BRIGHT_YELLOW)
+        .modify(Columns::new(3..5).not(Rows::first()), style::dim())
+        .to_string();
+    println!("{table}");
+
+    args.limit.print_summary(show, total, "note");
+}
+
+pub fn add(args: NoteAddArgs) {
+    dialog::run("Add note", || {
+        let target_input = match args.target {
+            Some(ref t) => t.clone(),
+            None => cli::input("Target")
+                .placeholder("session-id or session-id:line")
+                .interact()?,
+        };
+        let target = resolve_target(&target_input)
+            .map_err(|e| DialogError::Other(io::Error::new(io::ErrorKind::InvalidInput, e)))?;
+
+        let name: String = match args.name {
+            Some(ref n) => n.clone(),
+            None => cli::input("Name")
+                .default_input("comment")
+                .placeholder("e.g. summary, tag, comment")
+                .interact()?,
+        };
+
+        let value: String = match args.value {
+            Some(ref v) => v.clone(),
+            None => cli::input("Value").placeholder("note content").interact()?,
+        };
+
+        let author = resolve_author(args.user);
+        let note = Note::new(target, &name, parse_note_value(&value), &author);
+        let conn = db::open_db();
+        note::insert(&conn, &note)
+            .map_err(|e| DialogError::Other(io::Error::other(e.to_string())))?;
+
+        cli::log::remark(format!("id: {}", note.id))?;
+        Ok("Note added".into())
+    });
+}
+
+pub fn comment(args: NoteCommentArgs) {
+    let conn = db::open_db();
+    let target_note = match note::get(&conn, &args.id) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    dialog::run("Comment on note", || {
+        cli::log::step(format!(
+            "Note\n{}",
+            console::style(short_uuid(&target_note.id)).dim()
+        ))?;
+
+        let msg: String = match args.msg {
+            Some(ref m) => {
+                cli::log::step(format!("Message\n{}", console::style(m).dim()))?;
+                m.clone()
+            }
+            None => cli::input("Message").interact()?,
+        };
+
+        let author = resolve_author(None);
+        let new_note = Note::new(target_note.target.clone(), "comment", msg.as_str(), &author);
+
+        if !args.yes {
+            let confirmed = cli::confirm("Add this comment?")
+                .initial_value(true)
+                .interact()?;
+            if !confirmed {
+                return Err(DialogError::Canceled);
+            }
+        }
+
+        note::insert(&conn, &new_note)
+            .map_err(|e| DialogError::Other(io::Error::other(e.to_string())))?;
+        insert_relation(&conn, &new_note.id, &target_note.id, "")
+            .map_err(|e| DialogError::Other(io::Error::other(e.to_string())))?;
+
+        cli::log::remark(format!("id: {}", new_note.id))?;
+        Ok("Comment added".into())
+    });
+}
+
+pub async fn show(args: NoteShowArgs) {
+    let conn = db::open_db();
+    let note = match note::get(&conn, &args.id) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let explanation_display = resolve_display(&note, note.explanation.as_deref());
+
+    let attrs = vec![
+        ("id", note.id.clone()),
+        ("name", note.name.clone()),
+        ("value", note.value.to_json()),
+        ("target", note.target.to_uri()),
+        ("explanation", explanation_display),
+        ("author", note.author.clone()),
+        ("created", gage_core::datetime::ms_to_iso8601(note.created)),
+        (
+            "modified",
+            note.modified
+                .map(gage_core::datetime::ms_to_iso8601)
+                .unwrap_or_default(),
+        ),
+        ("metadata", note.metadata.unwrap_or_default()),
+    ];
+
+    let related = match note::related(&conn, &note.id) {
+        Ok(rs) => rs,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let label_width = attrs
+        .iter()
+        .map(|(k, _)| k.len())
+        .chain(std::iter::once("related".len()))
+        .max()
+        .unwrap_or(0);
+    let (_, term_width) = console::Term::stdout().size();
+    // Borders + padding: "│ " + " │ " + " │" = 8 chars
+    let value_width = (term_width as usize)
+        .saturating_sub(label_width + 8)
+        .max(20);
+
+    let target_cell = if args.target_content {
+        let ctx = gage_query::create_context_default().await;
+        match crate::target_content::render_target_cell(&ctx, &note.target, value_width).await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("Error rendering target content: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut rows: Vec<Vec<String>> = attrs
+        .into_iter()
+        .map(|(k, v)| {
+            let value = if k == "target" {
+                if let Some(ref cell) = target_cell {
+                    cell.clone()
+                } else {
+                    textwrap::fill(&v, value_width)
+                }
+            } else {
+                textwrap::fill(&v, value_width)
+            };
+            vec![k.to_string(), value]
+        })
+        .collect();
+
+    if !related.is_empty() {
+        let entries: Vec<String> = related
+            .iter()
+            .map(|r| {
+                let header = format!("{} ({})", r.name, short_uuid(&r.id));
+                let value_str = r.value.to_json();
+                let value = textwrap::fill(&value_str, value_width);
+                format!("{header}\n{value}")
+            })
+            .collect();
+        rows.push(vec!["related".to_string(), entries.join("\n\n")]);
+    }
+
+    let table = Table::from_iter(rows)
+        .with(Style::rounded())
+        .modify(Columns::first(), Color::FG_BRIGHT_YELLOW)
+        .to_string();
+    println!("{table}");
+}
+
+fn note_text_resolver(note: &Note) -> TextResolver {
+    let registry = ScannerRegistry::load();
+    let r = TextResolver::new();
+    match note.author.strip_prefix("scanner:") {
+        Some(name) => match ScannerScheme::for_scanner_name(&registry, name) {
+            Ok(s) => r.with_scheme("scanner", s),
+            Err(e) => r.with_scheme("scanner", ErrorScheme::new(e.to_string())),
+        },
+        None => r.with_scheme("scanner", ScannerScheme::absolute_only()),
+    }
+}
+
+fn resolve_display(note: &Note, value: Option<&str>) -> String {
+    let Some(raw) = value else {
+        return String::new();
+    };
+    let resolver = note_text_resolver(note);
+    match resolver.resolve(raw.to_string()) {
+        Ok(text) => text,
+        Err(e) => format!("(unresolved {raw}: {e})"),
+    }
+}
+
+/// Interpret CLI value input as JSON, falling back to a plain string.
+/// `true`, `42`, `{"k":1}` parse as their JSON types; a bare word like
+/// `comment` isn't valid JSON, so it's stored as a JSON string.
+fn parse_note_value(input: &str) -> note::NoteValue {
+    match serde_json::from_str::<serde_json::Value>(input) {
+        Ok(v) => note::NoteValue(v),
+        Err(_) => note::NoteValue::from(input),
+    }
+}
+
+pub fn edit(args: NoteEditArgs) {
+    dialog::run("Edit note", || {
+        let conn = db::open_db();
+        let note = note::get(&conn, &args.id)
+            .map_err(|e| DialogError::Other(io::Error::other(e.to_string())))?;
+
+        let default_input = note.value.to_json();
+        let value: String = match args.value {
+            Some(ref v) => v.clone(),
+            None => cli::input("Value")
+                .default_input(&default_input)
+                .placeholder("new value")
+                .interact()?,
+        };
+
+        let modified = gage_core::datetime::now_ms();
+        let note_value = parse_note_value(&value);
+        note::update(&conn, &note.id, &note_value, modified)
+            .map_err(|e| DialogError::Other(io::Error::other(e.to_string())))?;
+
+        cli::log::remark(format!("id: {}", note.id))?;
+        Ok("Note updated".into())
+    });
+}
+
+pub fn delete(args: NoteDeleteArgs) {
+    if args.ids.is_empty() {
+        eprintln!(
+            "gage note delete: provide one or more note IDs\n\n\
+             Use 'gage note list' to show notes"
+        );
+        std::process::exit(1);
+    }
+
+    let conn = db::open_db();
+
+    let mut notes: Vec<Note> = Vec::new();
+    let mut errors = 0;
+    for prefix in &args.ids {
+        match note::get(&conn, prefix) {
+            Ok(n) => notes.push(n),
+            Err(e) => {
+                eprintln!("{e}");
+                errors += 1;
+            }
+        }
+    }
+    if errors > 0 {
+        std::process::exit(1);
+    }
+
+    let count = notes.len();
+
+    dialog::run("Delete notes", || {
+        let plural = if count == 1 { "note" } else { "notes" };
+        cli::log::remark(format!("{count} {plural}"))?;
+
+        if !args.yes {
+            let prompt = format!("Permanently delete {count} {plural}? This cannot be undone.");
+            let confirmed = cli::confirm(prompt).initial_value(false).interact()?;
+            if !confirmed {
+                return Err(DialogError::Canceled);
+            }
+        }
+
+        let mut deleted = 0;
+        for note in &notes {
+            if let Err(e) = note::delete(&conn, &note.id) {
+                eprintln!("warning: failed to delete {}: {e}", short_uuid(&note.id));
+            } else {
+                deleted += 1;
+            }
+        }
+
+        let plural = if deleted == 1 { "note" } else { "notes" };
+        Ok(format!("Deleted {deleted} {plural}").into())
+    });
+}
+
+fn resolve_target(input: &str) -> Result<NoteTarget, String> {
+    let (prefix, rest) = match input.split_once(':') {
+        Some((p, r)) => (p, Some(r)),
+        None => (input, None),
+    };
+    let session = one_session(prefix).map_err(|e| e.to_string())?;
+    let resolved = match rest {
+        Some(r) => format!("{}:{r}", session.id),
+        None => session.id,
+    };
+    SessionTarget::parse(&resolved)
+        .map(NoteTarget::Session)
+        .map_err(|e| e.to_string())
+}
+
+fn shorten_target(target: &NoteTarget) -> String {
+    let (glyph, s) = match target {
+        NoteTarget::Session(t) => ("▪", t.to_uri()),
+        NoteTarget::Scan(t) => ("≡", t.scan_id.clone()),
+        NoteTarget::Project(t) => ("⊡", t.project_path.clone()),
+    };
+    let shortened = if s.len() >= 36 {
+        format!("{}{}", &s[..8], &s[36..])
+    } else {
+        s
+    };
+    format!("{glyph} {shortened}")
+}

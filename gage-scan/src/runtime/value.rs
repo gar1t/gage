@@ -1,0 +1,63 @@
+use rune::alloc;
+use rune::runtime::{Object, Value};
+use serde_json as json;
+
+use super::json::Null;
+
+pub(crate) fn json_to_object(val: &json::Value) -> Object {
+    let mut obj = Object::new();
+    if let json::Value::Object(map) = val {
+        for (k, v) in map {
+            let key = alloc::String::try_from(k.as_str()).unwrap();
+            let val = json_to_value(v);
+            obj.insert(key, val).unwrap();
+        }
+    }
+    obj
+}
+
+pub(crate) fn json_to_value(val: &json::Value) -> Value {
+    match val {
+        json::Value::Null => rune::to_value(Null).unwrap(),
+        json::Value::Bool(b) => rune::to_value(*b).unwrap(),
+        json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                rune::to_value(i).unwrap()
+            } else if let Some(f) = n.as_f64() {
+                rune::to_value(f).unwrap()
+            } else {
+                rune::to_value(()).unwrap()
+            }
+        }
+        json::Value::String(s) => {
+            let rs = alloc::String::try_from(s.as_str()).unwrap();
+            Value::new(rs).unwrap()
+        }
+        json::Value::Array(arr) => {
+            let vec: Vec<Value> = arr.iter().map(json_to_value).collect();
+            rune::to_value(vec).unwrap()
+        }
+        json::Value::Object(_) => rune::to_value(json_to_object(val)).unwrap(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use rune::TypeHash;
+    use serde_json::json;
+
+    #[test]
+    fn null_maps_to_null_type() {
+        assert_eq!(json_to_value(&json!(null)).type_hash(), Null::HASH);
+    }
+
+    #[test]
+    fn non_null_is_unaffected() {
+        assert_eq!(
+            rune::from_value::<i64>(json_to_value(&json!(7))).unwrap(),
+            7
+        );
+    }
+}

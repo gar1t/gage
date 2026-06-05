@@ -1,0 +1,93 @@
+//! Events emitted by the scanner runner during a run.
+//!
+//! The runner is a pure event emitter. Consumers (CLI, MCP, tests)
+//! implement an event sink. Each `Status` event is a self-contained
+//! snapshot — never reassemble state from partial deltas.
+
+/// A target a task is acting against. Carried on `TaskRef` so a UI can
+/// label "scanner::task → target".
+#[derive(Debug, Clone)]
+pub enum TargetLabel {
+    /// Specific session id.
+    Session(String),
+    /// Project cwd; the task ran against that project's Claude config.
+    Project(String),
+    /// All selected sessions of the current scan (scan-context task).
+    Scan,
+}
+
+impl std::fmt::Display for TargetLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TargetLabel::Session(id) => write!(f, "session {id}"),
+            TargetLabel::Project(name) => write!(f, "project {name}"),
+            TargetLabel::Scan => write!(f, "scan"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskRef {
+    pub scanner: String,
+    pub task: String,
+    pub target: TargetLabel,
+}
+
+/// One worker slot. `current` reflects what that worker is doing right
+/// now; `None` means the worker is idle.
+#[derive(Debug, Clone)]
+pub struct WorkerStatus {
+    pub id: usize,
+    pub current: Option<TaskRef>,
+}
+
+/// Full live state of a scan run. Self-contained — every emission is a
+/// complete picture so consumers never reassemble.
+#[derive(Debug, Clone)]
+pub struct RunStatus {
+    pub scan_id: String,
+    /// Tasks that will be processed. Decreases when a scanner faults
+    /// and its remaining tasks are removed from the pipeline. Use with
+    /// `progress` directly as bar length/position.
+    pub total: usize,
+    /// Completed + failed. Drives the bar position.
+    pub progress: usize,
+    pub workers: Vec<WorkerStatus>,
+}
+
+/// End-of-run accounting. Returned from `run()`. Distinct from
+/// `RunStatus` because the final report wants the skipped count broken
+/// out separately.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RunSummary {
+    pub scan_id: String,
+    pub total: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub skipped: usize,
+}
+
+#[derive(Debug)]
+pub enum ScanEvent {
+    /// Self-contained progress snapshot.
+    Status(RunStatus),
+    /// Bytes from a scanner `print(...)` call, verbatim.
+    Print { s: String },
+    /// Bytes from a scanner `println(...)` call, verbatim (no trailing newline).
+    Println { s: String },
+    /// A task returned an Err or panicked. The UI is responsible for
+    /// rendering this above any active progress bars.
+    TaskFailed {
+        scanner: String,
+        task: String,
+        target: TargetLabel,
+        message: String,
+    },
+    /// A non-fatal planner warning (e.g. an unsatisfied `wants` note).
+    /// The task still runs; the wanted note simply isn't available.
+    Warning {
+        scanner: String,
+        task: String,
+        message: String,
+    },
+}

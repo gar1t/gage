@@ -1,0 +1,17 @@
+[package]
+name = "gage-tui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+datafusion = { workspace = true }
+gage-claude = { path = "../gage-claude" }
+gage-query = { path = "../gage-query" }
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
+serde_json = { workspace = true }
+serde_yml = "0.0.12"
+syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "default-themes", "regex-onig"] }
+pulldown-cmark = { version = "0.13", default-features = false }
+
+[lints]
+workspace = true

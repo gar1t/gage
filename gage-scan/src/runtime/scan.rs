@@ -1,0 +1,211 @@
+use gage_claude::project::Project as ClaudeProject;
+use gage_claude::session::encode_project_dir;
+use rune::runtime::{Object, Value, VmError};
+use rune::{Any, ContextError, Module};
+
+use crate::runtime::state::{TaskTarget, current_scan_ctx};
+
+use super::datetime::DateTime;
+use super::value::json_to_value;
+
+pub(crate) fn register(m: &mut Module) -> Result<(), ContextError> {
+    m.function("session", session).build()?;
+    m.function("project", project).build()?;
+    m.function("scan", scan).build()?;
+    m.function("params", params).build()?;
+    Ok(())
+}
+
+pub(crate) fn types_module() -> Result<Module, ContextError> {
+    let mut m = Module::new();
+
+    // Session.id, Project.{name,path} getters are derived by #[rune(get)].
+    m.ty::<Session>()?;
+    m.ty::<Scan>()?;
+    m.function_meta(Scan::sessions)?;
+    m.ty::<Project>()?;
+
+    m.ty::<Sessions>()?;
+    m.function_meta(Sessions::next__meta)?;
+    m.function_meta(Sessions::nth__meta)?;
+    m.function_meta(Sessions::size_hint__meta)?;
+    m.function_meta(Sessions::len__meta)?;
+    m.function_meta(Sessions::next_back__meta)?;
+    m.implement_trait::<Sessions>(rune::item!(::std::iter::Iterator))?;
+    m.implement_trait::<Sessions>(rune::item!(::std::iter::DoubleEndedIterator))?;
+
+    super::datetime::register_types(&mut m)?;
+    super::query::register_types(&mut m)?;
+    super::error::register_types(&mut m)?;
+    super::ignore::register_types(&mut m)?;
+    super::db::register_types(&mut m)?;
+    super::config::register_types(&mut m)?;
+    Ok(m)
+}
+
+#[derive(Any, Clone)]
+#[rune(item = ::gage)]
+pub struct Session {
+    #[rune(get)]
+    pub id: String,
+    #[rune(get)]
+    pub modified: DateTime,
+}
+
+#[derive(Any, Clone)]
+#[rune(item = ::gage)]
+pub struct Scan {
+    #[rune(get)]
+    pub id: String,
+    #[rune(skip)]
+    pub session_list: Vec<Session>,
+}
+
+impl Scan {
+    #[rune::function(instance)]
+    fn sessions(&self) -> Sessions {
+        Sessions::new(self.session_list.clone())
+    }
+
+    pub fn session_ids(&self) -> Vec<String> {
+        self.session_list.iter().map(|s| s.id.clone()).collect()
+    }
+}
+
+// Double-ended iterator over a scan's selected sessions, yielding
+// newest-modified first. Mirrors std::slice::Iter so scanners get the
+// full Iterator surface (rev, collect, map, ...) via implement_trait.
+#[derive(Any)]
+#[rune(item = ::gage)]
+pub struct Sessions {
+    #[rune(skip)]
+    items: Vec<Session>,
+    #[rune(skip)]
+    front: usize,
+    #[rune(skip)]
+    back: usize,
+}
+
+impl Sessions {
+    fn new(items: Vec<Session>) -> Self {
+        let back = items.len();
+        Sessions {
+            items,
+            front: 0,
+            back,
+        }
+    }
+
+    #[rune::function(instance, keep, protocol = NEXT)]
+    fn next(&mut self) -> Option<Session> {
+        if self.front == self.back {
+            return None;
+        }
+        let value = self.items.get(self.front)?.clone();
+        self.front = self.front.wrapping_add(1);
+        Some(value)
+    }
+
+    #[rune::function(instance, keep, protocol = NTH)]
+    fn nth(&mut self, n: usize) -> Option<Session> {
+        let n = self.front.wrapping_add(n);
+        if n >= self.back || n < self.front {
+            return None;
+        }
+        let value = self.items.get(n)?.clone();
+        self.front = n.wrapping_add(1);
+        Some(value)
+    }
+
+    #[rune::function(instance, keep, protocol = SIZE_HINT)]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.back.wrapping_sub(self.front);
+        (len, Some(len))
+    }
+
+    #[rune::function(instance, keep, protocol = LEN)]
+    fn len(&self) -> usize {
+        self.back.wrapping_sub(self.front)
+    }
+
+    #[rune::function(instance, keep, protocol = NEXT_BACK)]
+    fn next_back(&mut self) -> Option<Session> {
+        if self.front == self.back {
+            return None;
+        }
+        self.back = self.back.wrapping_sub(1);
+        let value = self.items.get(self.back)?.clone();
+        Some(value)
+    }
+}
+
+#[derive(Any, Clone)]
+#[rune(item = ::gage)]
+pub struct Project {
+    #[rune(get)]
+    pub name: String,
+    #[rune(get)]
+    pub path: String,
+}
+
+fn session() -> Result<Session, VmError> {
+    let ctx = current_scan_ctx();
+    match &ctx.target {
+        TaskTarget::Session { info, .. } => Ok(Session {
+            id: info.id.clone(),
+            modified: DateTime::from_system_time(info.mtime),
+        }),
+        TaskTarget::Project(_) => Err(VmError::panic(
+            "session() is not available in a project-context task",
+        )),
+        TaskTarget::Scan => Err(VmError::panic(
+            "session() is not available in a scan-context task",
+        )),
+    }
+}
+
+fn project() -> Result<Project, VmError> {
+    let ctx = current_scan_ctx();
+    match &ctx.target {
+        TaskTarget::Session { project, .. } => {
+            project.as_deref().map(rune_project).ok_or_else(|| {
+                VmError::panic("project() is not available: session has no resolved project")
+            })
+        }
+        TaskTarget::Project(p) => Ok(rune_project(p)),
+        TaskTarget::Scan => Err(VmError::panic(
+            "project() is not available in a scan-context task",
+        )),
+    }
+}
+
+fn rune_project(p: &ClaudeProject) -> Project {
+    Project {
+        name: encode_project_dir(&p.path),
+        path: p.path.to_string_lossy().into_owned(),
+    }
+}
+
+fn scan() -> Scan {
+    let ctx = current_scan_ctx();
+    Scan {
+        id: ctx.run.scan_id.clone(),
+        session_list: ctx
+            .run
+            .selected
+            .iter()
+            .map(|s| Session {
+                id: s.id.clone(),
+                modified: DateTime::from_system_time(s.mtime),
+            })
+            .collect(),
+    }
+}
+
+fn params() -> Value {
+    let ctx = current_scan_ctx();
+    match &ctx.params {
+        Some(json_val) => json_to_value(json_val),
+        None => rune::to_value(Object::new()).unwrap(),
+    }
+}
