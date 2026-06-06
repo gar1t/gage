@@ -1,20 +1,28 @@
 name: Release
 
 # Publish an already-built commit as a release ("release in retrospect").
-# Triggered by pushing a version tag at a commit that has a successful Build
-# run. This does NOT build: it gathers that build's artifacts and publishes
-# them under the tag.
+# Triggered by pushing a commit to the `release` branch. This does NOT build:
+# it gathers that commit's Build artifacts and publishes them.
 #
-# Process: push a commit to the build branch, watch Build go green, then tag
-# that commit and push the tag. The tag marks a commit already proven to build.
+# Everything is driven from source, not from a tag:
+#   - the version comes from Cargo.toml (the authoritative source)
+#   - the release notes come from the matching section of CHANGELOG.md
+# The tag is created as a byproduct, named for the version. Tags drive nothing.
 #
-# Re-running after a transient failure: `gh run rerun <id> --failed`. No
-# rebuild — the build artifacts are reused.
+# Process: push a commit to the build branch, watch Build go green, then push
+# that same commit to the release branch.
+#
+# The workflow is create-only and never deletes anything. If a release for the
+# version already exists it fails immediately, so a stray push to `release` can
+# never destroy a published release. To re-release a version on a different
+# commit, a human deletes it out of band with:
+#   gh release delete <version> --cleanup-tag --yes
+# then pushes the chosen commit to `release`.
 
 on:
   push:
-    tags:
-      - '**[0-9]+.[0-9]+.[0-9]+*'
+    branches:
+      - release
 
 permissions:
   contents: write   # create the release
@@ -22,16 +30,45 @@ permissions:
 
 env:
   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  BIN: gage
 
 jobs:
   release:
     runs-on: ubuntu-22.04
     steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          # Authoritative version, same read as the Build workflow.
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          [ -n "$version" ] || { echo "could not read crate version" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Guard against existing tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Fail fast and touch nothing if the tag already exists. Keyed on the
+          # tag (not the release) because the tag is what pins the commit: a
+          # tag that exists without a release would otherwise let the release
+          # attach to the wrong commit. A missing ref returns HTTP 404, so the
+          # api call fails and the guard passes.
+          if gh api "repos/$GITHUB_REPOSITORY/git/refs/tags/$VERSION" >/dev/null 2>&1; then
+            echo "::error::Tag $VERSION already exists. To re-release this version on a" \
+                 "different commit, delete it first: gh release delete $VERSION --cleanup-tag --yes" >&2
+            exit 1
+          fi
+
       - name: Locate build run for this commit
         id: build
         run: |
-          # GITHUB_SHA is the commit the tag points at; it must have been built
-          # (pushed to the build branch) already.
+          # GITHUB_SHA is the commit pushed to the release branch; it must have
+          # been built (pushed to the build branch) already.
           run_id="$(gh run list \
             --repo "$GITHUB_REPOSITORY" \
             --workflow build.yml \
@@ -42,7 +79,7 @@ jobs:
 
           if [ -z "$run_id" ]; then
             echo "::error::No successful Build run for $GITHUB_SHA." \
-                 "Push this commit to the build branch, let Build finish, then tag it." >&2
+                 "Push this commit to the build branch, let Build finish, then push it to release." >&2
             exit 1
           fi
           echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
@@ -62,18 +99,47 @@ jobs:
         working-directory: dist
         run: sha256sum * > SHA256SUMS
 
-      - name: Create release
+      - name: Extract release notes
+        id: notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          # The tag is the release version; a semver prerelease carries a
-          # suffix (e.g. 0.0.1-pre.1).
-          case "$GITHUB_REF_NAME" in
+          # The release body is the CHANGELOG.md section for this version: the
+          # lines between the `## ...VERSION...` heading and the next `## `
+          # heading. Notes are sourced from the committed tree, just like the
+          # version. A missing section fails the release.
+          notes_file="$(mktemp)"
+          awk -v ver="$VERSION" '
+            /^## / {
+              if (in_section) exit
+              if (index($0, ver) > 0) { in_section = 1; next }
+            }
+            in_section { print }
+          ' CHANGELOG.md > "$notes_file"
+
+          # Trim leading/trailing blank lines; fail if nothing was captured.
+          if ! grep -q '[^[:space:]]' "$notes_file"; then
+            echo "::error::No CHANGELOG.md section found for $VERSION." \
+                 "Add a '## [$VERSION]' heading with notes before releasing." >&2
+            exit 1
+          fi
+          echo "file=$notes_file" >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          NOTES_FILE: ${{ steps.notes.outputs.file }}
+        run: |
+          # A semver prerelease carries a suffix (e.g. 0.0.1-pre.2). Creating
+          # the release also creates the tag at this commit.
+          case "$VERSION" in
             *-*) prerelease=--prerelease ;;
             *)   prerelease= ;;
           esac
 
-          gh release create "$GITHUB_REF_NAME" \
+          gh release create "$VERSION" \
             --target "$GITHUB_SHA" \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes \
+            --title "$VERSION" \
+            --notes-file "$NOTES_FILE" \
             $prerelease \
             dist/*

@@ -35,25 +35,48 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          # The first top-level `version =` in Cargo.toml is the workspace
+          # version that every crate inherits. It names the artifact and keys
+          # the build cache, so a green build for a version is reused, never
+          # recompiled. Indented `version =` lines under other tables don't
+          # match the `^version` anchor.
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          [ -n "$version" ] || { echo "could not read crate version" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Restore build cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          # Key on version + target. A successful build saves the binary under
+          # this key at job end; an immutable hit on a later run skips the
+          # compile entirely. A failed build never populates the cache, so a
+          # previously-failed target rebuilds while green targets are reused.
+          # Bump the version to force a full rebuild.
+          key: build-${{ steps.version.outputs.version }}-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ env.BIN }}
+
       - name: Install Rust
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           rustup toolchain install stable --profile minimal
           rustup target add ${{ matrix.target }}
 
       - name: Build
+        if: steps.cache.outputs.cache-hit != 'true'
         run: cargo build --release --target ${{ matrix.target }} --bin "$BIN"
 
       - name: Package
         id: package
         shell: bash
         run: |
-          # Name artifacts by the crate version, not the triggering ref, so the
-          # bytes are release-ready regardless of how the build was triggered.
-          # The first top-level `version =` in Cargo.toml is the workspace
-          # version that every crate inherits.
-          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-          [ -n "$version" ] || { echo "could not read crate version" >&2; exit 1; }
-
+          # Source the binary from cache-or-build; this runs every time so each
+          # build run emits a complete artifact set for the release workflow.
+          version="${{ steps.version.outputs.version }}"
           archive="${BIN}-${version}-${{ matrix.target }}.tar.gz"
 
           staging="$(mktemp -d)"
