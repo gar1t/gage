@@ -17,7 +17,7 @@ install-path = "~/.local/bin"
 install-updater = false
 # Build only the required packages, and individually
 precise-builds = true
-github-build-setup = "build-setup.yml"
+github-build-setup = "includes/build-setup.yml"
 
 [dist.github-custom-runners]
 x86_64-unknown-linux-gnu = "ubuntu-22.04"
