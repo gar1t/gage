@@ -1,0 +1,70 @@
+name: Build
+
+# Compile and package platform artifacts, keyed to the commit that produced
+# them. These artifacts are durable workflow artifacts; the Release workflow
+# locates and publishes them later by matching the commit SHA, so a release
+# never rebuilds.
+#
+# Adding a platform = adding a row to the matrix. The steps are generic.
+
+on:
+  push:
+    # Building is opt-in: a commit is built only when pushed to the build
+    # branch. Nothing builds automatically on main.
+    branches:
+      - build
+
+permissions:
+  contents: read
+
+env:
+  BIN: gage
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} --bin "$BIN"
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          # Name artifacts by the crate version, not the triggering ref, so the
+          # bytes are release-ready regardless of how the build was triggered.
+          # The first top-level `version =` in Cargo.toml is the workspace
+          # version that every crate inherits.
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          [ -n "$version" ] || { echo "could not read crate version" >&2; exit 1; }
+
+          archive="${BIN}-${version}-${{ matrix.target }}.tar.gz"
+
+          staging="$(mktemp -d)"
+          cp "target/${{ matrix.target }}/release/${BIN}" "$staging/"
+          tar -C "$staging" -czf "$archive" "$BIN"
+
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: artifact-${{ matrix.target }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error

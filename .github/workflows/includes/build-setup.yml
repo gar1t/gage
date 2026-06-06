@@ -1,3 +1,0 @@
-- name: Use crate version for release builds
-  shell: bash
-  run: echo "RELEASE=1" >> "$GITHUB_ENV"
