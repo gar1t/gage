@@ -12,7 +12,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.0.1"
+version = "0.0.1-pre.1"
 edition = "2024"
 
 [workspace.dependencies]
@@ -58,7 +58,19 @@ map_err_ignore = "warn"
 unused_result_ok = "warn"
 indexing_slicing = "warn"
 
-# The profile that 'dist' will build with
+[workspace.metadata.dist]
+cargo-dist-version = "0.32.0"
+ci = "github"
+installers = ["shell"]
+targets = ["x86_64-unknown-linux-gnu"]
+install-path = "~/.local/bin"
+install-updater = false
+precise-builds = true
+github-build-setup = "includes/build-setup.yml"
+
+[workspace.metadata.dist.github-custom-runners]
+x86_64-unknown-linux-gnu = "ubuntu-22.04"
+
 [profile.dist]
 inherits = "release"
 lto = "fat"
