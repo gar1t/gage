@@ -1,3 +1,7 @@
+# Local
+.jj
+.notes
+
 # Rust
 target
 
@@ -7,6 +11,3 @@ target
 
 # Datafusion
 .history
-
-# Misc
-.jj
