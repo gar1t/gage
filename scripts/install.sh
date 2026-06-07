@@ -106,7 +106,7 @@ main() {
     [ -n "$version" ] || err "could not determine release version"
     install_dir="${GAGE_INSTALL_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}"
 
-    info "installing ${BIN} ${version} (${target}) to ${install_dir}"
+    info "Installing ${BIN} ${version} (${target}) to ${install_dir}"
 
     archive_url="$(asset_url "$version" "$target")"
     [ -n "$archive_url" ] || err "no ${target} asset in release ${version}"
