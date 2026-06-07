@@ -1,13 +1,20 @@
 # Gage
 
-Gage is a tool to analyze Claude Code transcripts to find issues and
-help resolve them.
+Gage is a tool to analyze Claude Code transcripts to find issues and help
+resolve them.
 
 To scan your sessions for issue, run:
 
 ```shell
 gage scan
 ```
+
+Select the scanners to run and the number of sessions to scan.
+
+Gage scans the sessions and reports any issues it finds.
+
+To resolve issues, run `/gage:review` in Claude Code (requires `gage init` to
+install plugin --- see below).
 
 ## Install
 
@@ -20,16 +27,25 @@ Supported plateforms:
 To run the install script, use:
 
 ```shell
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/gageml/gage/releases/latest/download/gage-cli-installer.sh | sh
+curl https://raw.githubusercontent.com/gageml/gage/refs/heads/main/scripts/install.sh | sh
 ```
 
-This installs the `gage` binary for your system to `~/.local/bin/gage`.
-It does not require elevated privileges.
+This installs the `gage` binary for your system to `~/.local/bin/gage`. It does
+not require elevated privileges.
 
-Alternatively, use `cargo-binstall`:
+### Install with `cargo binstall`
+
+If you have `cargo-binstall` installed, you can install Gage by running:
 
 ```shell
 cargo binstall --git https://github.com/gageml/gage gage-cli
+```
+
+To install `cargo-binstall`, ensure that you have the
+[Rust toolchain](https://rustup.rs/) installed and then run:
+
+```shell
+cargo install cargo-binstall --locked
 ```
 
 ### Install from source
@@ -50,6 +66,8 @@ Install the Gage CLI:
 cargo install --path gage-cli
 ```
 
+### Claude Code plugin
+
 Install the Gage Claude plugin:
 
 ```shell
@@ -60,26 +78,25 @@ gage init
 
 ### Scan Claude Code transcripts (session)
 
-`gage scan` runs _scanners_ on your Claude Code sessions. Scanners are
-self contained programs written in the
-[Rune](https://rune-rs.github.io/) programming language. You can examine
-their source code under [scanners](/scanners) in this repository.
+`gage scan` runs _scanners_ on your Claude Code sessions. Scanners are self
+contained programs written in the [Rune](https://rune-rs.github.io/)
+programming language. You can examine their source code under
+[scanners](/scanners) in this repository.
 
 When you run `gage scan` you can select the scanners you want to run.
-Alternatively, you can specify each scanner using the `-s/--scanner`
-option. By default, Gage runs all available scanners.
+Alternatively, you can specify each scanner using the `-s/--scanner` option. By
+default, Gage runs all available scanners.
 
-You can also specify how many sessions you want to scan. By default Gage
-scans the last 20 sessions. To scan all available sessions, use the
-`-a/--all` option. Otherwise you can set the number with `-l/--limit`.
+You can also specify how many sessions you want to scan. By default Gage scans
+the last 20 sessions. To scan all available sessions, use the `-a/--all`
+option. Otherwise you can set the number with `-l/--limit`.
 
-Scanners look at Claude session files (under `~/.claude/projects/`) as
-well as Claude configuration for scanned sessions. Scanners report
-_evidence_ by writing notes and open _issues_ when there's enough
-evidence.
+Scanners look at Claude session files (under `~/.claude/projects/`) as well as
+Claude configuration for scanned sessions. Scanners report _evidence_ by
+writing notes and open _issues_ when there's enough evidence.
 
-Issues call your attention to something. Issues are meant to be resolved
-by either completing them or by skipping them.
+Issues call your attention to something. Issues are meant to be resolved by
+either completing them or by skipping them.
 
 List unresolved issues:
 
@@ -89,21 +106,19 @@ gage issue list
 
 ### Resolve issues
 
-Gage is designed to use Claude Code to evaluate and resolve issues. To
-resolve issues, run the `/gage:review` command in Claude Code. This
-command work in any standard Claude Code interface (e.g. CLI, VS Code
-extension, etc.)
+Gage is designed to use Claude Code to evaluate and resolve issues. To resolve
+issues, run the `/gage:review` command in Claude Code. This command work in any
+standard Claude Code interface (e.g. CLI, VS Code extension, etc.)
 
 ```
 > /gage:review
 ```
 
-Claude uses the available Gage tools to list and read open issues.
-You're free to work through issues with Claude's help as you see fit.
-Each issue provides information to confirm the problem and advice on
-fixing it. If you decide it's not a problem, skip it --- Claude can
-close the issue as `skipped`. If you resolve the issue, Claude can close
-the issue as `completed`.
+Claude uses the available Gage tools to list and read open issues. You're free
+to work through issues with Claude's help as you see fit. Each issue provides
+information to confirm the problem and advice on fixing it. If you decide it's
+not a problem, skip it --- Claude can close the issue as `skipped`. If you
+resolve the issue, Claude can close the issue as `completed`.
 
 To review open issues, run:
 
@@ -131,8 +146,8 @@ gage issue delete <ISSUE ID>
 
 ## Notes
 
-_Notes_ are values associated to sessions, session lines, and project
-config. Scanners write notes as evidence for issues.
+_Notes_ are values associated to sessions, session lines, and project config.
+Scanners write notes as evidence for issues.
 
 List notes:
 
@@ -140,10 +155,9 @@ List notes:
 gage note list
 ```
 
-Some scanners require a certain amount of evidence before opening an
-issue. For this reason, notes are generally retained over time. Notes
-are useful as factual records both for issues (evidence) and for session
-analysis.
+Some scanners require a certain amount of evidence before opening an issue. For
+this reason, notes are generally retained over time. Notes are useful as
+factual records both for issues (evidence) and for session analysis.
 
 ## Gage Query
 
@@ -156,17 +170,17 @@ analysis.
 
 Scanners use this facility exclusively for read-only data.
 
-Use `gage query -c SQL` to run queries yourself. This is useful for
-analysis you'd like to perform on sessions, notes, or issues.
+Use `gage query -c SQL` to run queries yourself. This is useful for analysis
+you'd like to perform on sessions, notes, or issues.
 
 Gage Query provides a PostgreSQL compatible interface. The REPL supports
-commands using the syntax `\COMMAND`. Run `\?` from the REPL to list
-availble commands.
+commands using the syntax `\COMMAND`. Run `\?` from the REPL to list availble
+commands.
 
 Note that Gage Query reads some data from local files (e.g. sessions and
-project config). Some queries will cause full file system scans, which
-are surprisingly slow and memory intensive. In general, avoid running
-unbounded queries
+project config). Some queries will cause full file system scans, which are
+surprisingly slow and memory intensive. In general, avoid running unbounded
+queries
 
 Avoid:
 
@@ -198,13 +212,11 @@ Gage writes all of its data to files under `~/.gage/`. These include:
 
 ### Does Gage "phone home" for any reason?
 
-No. Gage runs locally and writes notes and all data under
-`~/.gage/data/`.
+No. Gage runs locally and writes notes and all data under `~/.gage/data/`.
 
-Gage provides tools to Claude Code over a local MCP server. Claude is
-free to use these tools within the constraints of user-defined
-premissions (allow and deny). Gage tools do not open network connections
-or otherwise write outside of `~/.gage/`. Claude, however, may. This is
-the normal risk profile of running an agent. To minimize the risk of
-sensitive data exfiltration, follow the safeguards recommended by
-Anthropic.
+Gage provides tools to Claude Code over a local MCP server. Claude is free to
+use these tools within the constraints of user-defined premissions (allow and
+deny). Gage tools do not open network connections or otherwise write outside of
+`~/.gage/`. Claude, however, may. This is the normal risk profile of running an
+agent. To minimize the risk of sensitive data exfiltration, follow the
+safeguards recommended by Anthropic.
