@@ -1,13 +1,10 @@
 # Local
 .jj
 .notes
+.local.*
 
 # Rust
 target
-
-# Claude
-.mcp.json
-.claude/*.local.json
 
 # Datafusion
 .history
