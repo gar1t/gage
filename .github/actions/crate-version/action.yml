@@ -1,0 +1,18 @@
+# Read the authoritative crate version from Cargo.toml. Shared by the
+# Build and Release workflows so they agree on a single source.
+
+name: Crate version
+description: Read the crate version from Cargo.toml
+outputs:
+  version:
+    description: Crate version string from Cargo.toml
+    value: ${{ steps.read.outputs.version }}
+runs:
+  using: composite
+  steps:
+    - id: read
+      shell: bash
+      run: |
+        version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+        [ -n "$version" ] || { echo "could not read crate version" >&2; exit 1; }
+        echo "version=$version" >> "$GITHUB_OUTPUT"

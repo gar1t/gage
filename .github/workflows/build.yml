@@ -1,23 +1,24 @@
-name: Build
+# Compile Gage for each target in the matrix and upload the resulting
+# tar.gz as an artifact named ${PKGNAME}-${version}-${target}. Hard
+# idempotent on (version, target): if an artifact with that name already
+# exists anywhere in the repo, the row exits without building. To force
+# a rebuild, delete the existing artifact first.
 
-# Compile and package platform artifacts, keyed to the commit that produced
-# them. These artifacts are durable workflow artifacts; the Release workflow
-# locates and publishes them later by matching the commit SHA, so a release
-# never rebuilds.
-#
-# Adding a platform = adding a row to the matrix. The steps are generic.
+name: Build
 
 on:
   push:
-    # Building is opt-in: a commit is built only when pushed to the build
-    # branch. Nothing builds automatically on main.
+    # Building is opt-in: a commit is built only when pushed to the
+    # build branch. Nothing builds automatically on main.
     branches:
       - build
 
 permissions:
   contents: read
+  actions: read # probe prior runs' artifacts for hard idempotency
 
 env:
+  PKGNAME: gage
   BIN: gage
 
 jobs:
@@ -28,66 +29,78 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # target is the value used by cargo --target and corresponds
+          # to the release triple arch-vendor-os[-env]
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
 
-      - name: Read version
+      - name: Read crate version
         id: version
-        shell: bash
-        run: |
-          # The first top-level `version =` in Cargo.toml is the workspace
-          # version that every crate inherits. It names the artifact and keys
-          # the build cache, so a green build for a version is reused, never
-          # recompiled. Indented `version =` lines under other tables don't
-          # match the `^version` anchor.
-          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-          [ -n "$version" ] || { echo "could not read crate version" >&2; exit 1; }
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+        uses: ./.github/actions/crate-version
 
-      - name: Restore build cache
+      - name: Check for previous artifact
+        # Set a flag if a previous job succeeded with an uploaded
+        # artifact. Sets `exists` output to yes or no.
+        id: artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NAME:
+            ${{ env.PKGNAME }}-${{ steps.version.outputs.version }}-${{
+            matrix.target }}
+        run: |
+          count="$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$NAME" \
+            --jq '.total_count')"
+          if [ "$count" -gt 0 ]; then
+            echo "$NAME already exists; skipping." >&2
+            echo "exists=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=no" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cache
+        if: steps.artifact.outputs.exists != 'yes'
         id: cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
-          # Key on version + target. A successful build saves the binary under
-          # this key at job end; an immutable hit on a later run skips the
-          # compile entirely. A failed build never populates the cache, so a
-          # previously-failed target rebuilds while green targets are reused.
-          # Bump the version to force a full rebuild.
           key: build-${{ steps.version.outputs.version }}-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/${{ env.BIN }}
 
       - name: Install Rust
-        if: steps.cache.outputs.cache-hit != 'true'
+        if:
+          steps.artifact.outputs.exists != 'yes' &&
+          steps.cache.outputs.cache-hit != 'true'
         run: |
           rustup toolchain install stable --profile minimal
           rustup target add ${{ matrix.target }}
 
       - name: Build
-        if: steps.cache.outputs.cache-hit != 'true'
+        if:
+          steps.artifact.outputs.exists != 'yes' &&
+          steps.cache.outputs.cache-hit != 'true'
         run: cargo build --release --target ${{ matrix.target }} --bin "$BIN"
 
       - name: Package
+        if: steps.artifact.outputs.exists != 'yes'
         id: package
         shell: bash
         run: |
-          # Source the binary from cache-or-build; this runs every time so each
-          # build run emits a complete artifact set for the release workflow.
           version="${{ steps.version.outputs.version }}"
-          archive="${BIN}-${version}-${{ matrix.target }}.tar.gz"
-
-          staging="$(mktemp -d)"
-          cp "target/${{ matrix.target }}/release/${BIN}" "$staging/"
-          tar -C "$staging" -czf "$archive" "$BIN"
-
+          archive="${PKGNAME}-${version}-${{ matrix.target }}.tar.gz"
+          tar -C "target/${{ matrix.target }}/release" -czf "$archive" "$BIN"
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
+        if: steps.artifact.outputs.exists != 'yes'
         uses: actions/upload-artifact@v7
         with:
-          name: artifact-${{ matrix.target }}
+          name:
+            ${{ env.PKGNAME }}-${{ steps.version.outputs.version }}-${{
+            matrix.target }}
           path: ${{ steps.package.outputs.archive }}
           if-no-files-found: error

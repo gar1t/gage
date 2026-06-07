@@ -1,23 +1,16 @@
-name: Release
+# Create a release with available built artifacts for the current crate
+# version.
+#
+# Artifacts are generated from build.yml (pushes to build branch). Once
+# all build targets are successfully uploaded, a push to the release
+# branch signals that Gage is ready for a release.
+#
+# Releases are keyed by crate version.
+#
+# New releases include release notes from CHANGELOG.md under the section
+# header `[{version}]`.
 
-# Publish an already-built commit as a release ("release in retrospect").
-# Triggered by pushing a commit to the `release` branch. This does NOT build:
-# it gathers that commit's Build artifacts and publishes them.
-#
-# Everything is driven from source, not from a tag:
-#   - the version comes from Cargo.toml (the authoritative source)
-#   - the release notes come from the matching section of CHANGELOG.md
-# The tag is created as a byproduct, named for the version. Tags drive nothing.
-#
-# Process: push a commit to the build branch, watch Build go green, then push
-# that same commit to the release branch.
-#
-# The workflow is create-only and never deletes anything. If a release for the
-# version already exists it fails immediately, so a stray push to `release` can
-# never destroy a published release. To re-release a version on a different
-# commit, a human deletes it out of band with:
-#   gh release delete <version> --cleanup-tag --yes
-# then pushes the chosen commit to `release`.
+name: Release
 
 on:
   push:
@@ -25,12 +18,12 @@ on:
       - release
 
 permissions:
-  contents: write   # create the release
-  actions: read     # list and download build artifacts
+  contents: write
+  actions: read
 
 env:
   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  BIN: gage
+  PKGNAME: gage
 
 jobs:
   release:
@@ -40,74 +33,49 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Read version
+      - name: Read crate version
         id: version
-        shell: bash
-        run: |
-          # Authoritative version, same read as the Build workflow.
-          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-          [ -n "$version" ] || { echo "could not read crate version" >&2; exit 1; }
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+        uses: ./.github/actions/read-version
 
-      - name: Guard against existing tag
+      - name: Artifacts
+        # Find every artifact named ${PKGNAME}-${VERSION}-* across the
+        # repo (regardless of which Build run produced it) and extract
+        # the tarball from each into dist/. If a name appears in more
+        # than one run, the highest id (most recent) wins.
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          # Fail fast and touch nothing if the tag already exists. Keyed on the
-          # tag (not the release) because the tag is what pins the commit: a
-          # tag that exists without a release would otherwise let the release
-          # attach to the wrong commit. A missing ref returns HTTP 404, so the
-          # api call fails and the guard passes.
-          if gh api "repos/$GITHUB_REPOSITORY/git/refs/tags/$VERSION" >/dev/null 2>&1; then
-            echo "::error::Tag $VERSION already exists. To re-release this version on a" \
-                 "different commit, delete it first: gh release delete $VERSION --cleanup-tag --yes" >&2
+          prefix="${PKGNAME}-${VERSION}-"
+          selected="$(mktemp)"
+          gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+            | jq -s "[.[].artifacts[] | select(.name | startswith(\"$prefix\"))] | group_by(.name) | map(max_by(.id))" \
+            > "$selected"
+          count="$(jq 'length' "$selected")"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::No artifacts for ${PKGNAME}-${VERSION}" >&2
             exit 1
           fi
-
-      - name: Locate build run for this commit
-        id: build
-        run: |
-          # GITHUB_SHA is the commit pushed to the release branch; it must have
-          # been built (pushed to the build branch) already.
-          run_id="$(gh run list \
-            --repo "$GITHUB_REPOSITORY" \
-            --workflow build.yml \
-            --status success \
-            --limit 100 \
-            --json databaseId,headSha \
-            --jq "map(select(.headSha==\"$GITHUB_SHA\")) | .[0].databaseId")"
-
-          if [ -z "$run_id" ]; then
-            echo "::error::No successful Build run for $GITHUB_SHA." \
-                 "Push this commit to the build branch, let Build finish, then push it to release." >&2
-            exit 1
-          fi
-          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
-
-      - name: Download built artifacts
-        run: |
-          gh run download "${{ steps.build.outputs.run_id }}" \
-            --repo "$GITHUB_REPOSITORY" \
-            --pattern 'artifact-*' \
-            --dir downloaded
-
-          # gh nests each artifact in its own directory; flatten to dist/.
           mkdir -p dist
-          find downloaded -type f -exec mv -t dist {} +
+          jq -r '.[] | "\(.id)\t\(.name)"' "$selected" | while IFS=$'\t' read -r id name; do
+            zip="$(mktemp --suffix=.zip)"
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "$zip"
+            unzip -j -o "$zip" -d dist/
+            rm -f "$zip"
+          done
 
       - name: Checksums
         working-directory: dist
         run: sha256sum * > SHA256SUMS
 
-      - name: Extract release notes
+      - name: Release notes
+        # Release body is the CHANGELOG.md section for the release
+        # version. Content consists of the lines between the `##
+        # ...VERSION...` heading and the next `## ` heading.
         id: notes
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          # The release body is the CHANGELOG.md section for this version: the
-          # lines between the `## ...VERSION...` heading and the next `## `
-          # heading. Notes are sourced from the committed tree, just like the
-          # version. A missing section fails the release.
           notes_file="$(mktemp)"
           awk -v ver="$VERSION" '
             /^## / {
@@ -116,7 +84,6 @@ jobs:
             }
             in_section { print }
           ' CHANGELOG.md > "$notes_file"
-
           # Trim leading/trailing blank lines; fail if nothing was captured.
           if ! grep -q '[^[:space:]]' "$notes_file"; then
             echo "::error::No CHANGELOG.md section found for $VERSION." \
@@ -125,20 +92,17 @@ jobs:
           fi
           echo "file=$notes_file" >> "$GITHUB_OUTPUT"
 
-      - name: Create release
+      - name: Release
         env:
           VERSION: ${{ steps.version.outputs.version }}
           NOTES_FILE: ${{ steps.notes.outputs.file }}
         run: |
-          # A semver prerelease carries a suffix (e.g. 0.0.1-pre.2). Creating
-          # the release also creates the tag at this commit.
+          # A semver prerelease carries a suffix (e.g. 0.0.1-pre.2).
           case "$VERSION" in
             *-*) prerelease=--prerelease ;;
             *)   prerelease= ;;
           esac
-
           gh release create "$VERSION" \
-            --target "$GITHUB_SHA" \
             --title "$VERSION" \
             --notes-file "$NOTES_FILE" \
             $prerelease \
