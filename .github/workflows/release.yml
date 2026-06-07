@@ -33,9 +33,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Read crate version
+      - name: Crate version
         id: version
-        uses: ./.github/actions/read-version
+        uses: ./.github/actions/crate-version
 
       - name: Artifacts
         # Find every artifact named ${PKGNAME}-${VERSION}-* across the

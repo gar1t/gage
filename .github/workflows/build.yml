@@ -39,11 +39,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Read crate version
+      - name: Crate version
         id: version
         uses: ./.github/actions/crate-version
 
-      - name: Check for previous artifact
+      - name: Previous artifact
         # Set a flag if a previous job succeeded with an uploaded
         # artifact. Sets `exists` output to yes or no.
         id: artifact
@@ -71,7 +71,7 @@ jobs:
           key: build-${{ steps.version.outputs.version }}-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/${{ env.BIN }}
 
-      - name: Install Rust
+      - name: Rust
         if:
           steps.artifact.outputs.exists != 'yes' &&
           steps.cache.outputs.cache-hit != 'true'
@@ -95,7 +95,7 @@ jobs:
           tar -C "target/${{ matrix.target }}/release" -czf "$archive" "$BIN"
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
 
-      - name: Upload artifact
+      - name: Artifact
         if: steps.artifact.outputs.exists != 'yes'
         uses: actions/upload-artifact@v7
         with:
