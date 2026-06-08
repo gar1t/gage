@@ -1,0 +1,20 @@
+[package]
+name = "gage-lsp"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "gage-lsp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+gage-scan = { path = "../gage-scan" }
+rune = { git = "https://github.com/gar1t/rune.git", branch = "gage", features = ["languageserver"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true
+
+[package.metadata.dist]
+dist = false

@@ -4,6 +4,7 @@ members = [
     "gage-claude",
     "gage-core",
     "gage-db",
+    "gage-lsp",
     "gage-mcp",
     "gage-query",
     "gage-scan",
