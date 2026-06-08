@@ -1,6 +1,6 @@
 # Show this help and exit
 help:
-    just -l
+    @just -l
 
 # Build Gage
 build:
