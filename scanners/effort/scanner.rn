@@ -1,0 +1,22 @@
+use gage::write_issue;
+
+pub const SCANNER = #{
+    name: "effort",
+    description: "Help configure optimal model effort levels",
+    tasks: #{ hook_issue: #{ context: "scan" } },
+};
+
+pub async fn hook_issue() {
+    // Technically we should check for the hook before writing an
+    // issue but this is a "keep status" issue and will not re-open
+    // on subsequent runs.
+    write_issue(
+        #{
+            name: "effort-hook",
+            title: "Install hook to log effort levels",
+            description: "scanner:effort-hook.md",
+        },
+    )
+    .keep_status()
+    .await?
+}
